@@ -48,6 +48,21 @@ CASES = [
     ("HTTP 502 -> retried, then reported", "http_502", False, 502, 3, None, None, False, 0),
     ("HTTP 503 no channel -> reported as availability", "http_503_nochannel", False, 503, 3, None, None, False, 0),
     ("malformed gzip handled safely", "gzip_bad", False, 502, 3, None, None, False, 0),
+    # --- HTTP 200 bodies Claude Code's own validator rejects ----------------
+    # Claude Code requires content:array + model:string + usage:object on a
+    # non-streaming /v1/messages reply. Anything it would reject must be
+    # retried here and reported as 502 -- never forwarded as a 200.
+    ("no usage field -> retried, never forwarded as 200", "nonstream_no_usage", False, 502, 3, None, None, False, 0),
+    ("usage not an object -> retried", "nonstream_usage_not_object", False, 502, 3, None, None, False, 0),
+    ("usage null is accepted (typeof null === object)", "nonstream_usage_null", False, 200, 1, None, "OK", False, 0),
+    ("no model field -> retried", "nonstream_no_model", False, 502, 3, None, None, False, 0),
+    ("model not a string -> retried", "nonstream_model_not_string", False, 502, 3, None, None, False, 0),
+    ("content is a string, not an array -> retried", "nonstream_content_string", False, 502, 3, None, None, False, 0),
+    ("content is an object, not an array -> retried", "nonstream_content_object", False, 502, 3, None, None, False, 0),
+    ("missing content -> existing behavior preserved", "nonstream_no_content", False, 502, 3, None, None, False, 0),
+    ("empty content array -> existing behavior preserved", "nonstream_empty_content", False, 502, 3, None, None, False, 0),
+    ("no usage once, then valid -> RECOVERS", "nonstream_flaky_usage", False, 200, 2, None, "recovered", False, 0),
+    ("HTTP 200 error object -> 502, upstream message kept", "nonstream_error_object", False, 502, 1, None, None, False, 0),
 ]
 
 
@@ -137,6 +152,22 @@ def main():
             errs.append("no error event after post-commit truncation")
         if scen == "error_event" and "overloaded_error" not in raw:
             errs.append("upstream error event not forwarded")
+        # The invalid body itself must never reach the client, and the proxy
+        # must say which field was missing.
+        if scen == "nonstream_no_usage":
+            if "missing_usage_field" not in raw:
+                errs.append("no missing_usage_field diagnostic in proxy error body")
+            if "billing" in raw:
+                errs.append("invalid upstream body leaked to the client")
+        # A genuine upstream error object must keep its own message, and must
+        # not be retried -- but must not arrive under HTTP 200 either.
+        if scen == "nonstream_error_object" and "overloaded_error" not in raw:
+            errs.append("upstream error message not preserved")
+        if scen == "nonstream_flaky_usage":
+            recovered = (after.get("retries_successful", 0)
+                         - before.get("retries_successful", 0))
+            if recovered < 1:
+                errs.append(f"retries_successful incremented by {recovered}, expected >= 1")
 
         if errs:
             print(f"[FAIL] {name}")

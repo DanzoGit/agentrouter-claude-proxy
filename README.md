@@ -44,6 +44,7 @@ to be one of a handful of concrete situations:
 | Billing / quota / credit metadata frames only | Not Anthropic events |
 | `data: null` or an OpenAI-style `data: [DONE]` mixed into the stream | Not valid Anthropic frames |
 | A stream that dies before `message_stop` | Truncated message |
+| A reply with `content` and `model` but no `usage` (a `billing` block instead) | Fails Claude Code's response validator |
 | A stale `content-encoding: gzip` header on an already-decompressed body | Client tries to gunzip plain text |
 
 Most of these are transient. Retrying the same request usually works. The
@@ -90,6 +91,13 @@ the internet.
 - **Detects invalid HTTP 200 responses** — empty body, `null` body, empty SSE
   stream, keep-alive-only stream, metadata-only stream, missing or empty
   `content`.
+- **Validates non-streaming replies the way Claude Code does** — a
+  non-streaming `/v1/messages` reply is accepted only if `content` is an array,
+  `model` is a string, and `usage` is present. Claude Code applies the same
+  check and rejects anything else as `empty or malformed response (HTTP 200)`,
+  so a reply that would fail there is retried here and reported as a 502
+  instead. Nothing is fabricated to make a reply pass: a missing `usage` is
+  never invented, and `billing` metadata is never converted into token counts.
 - **Detects malformed responses** — unparseable JSON, a non-SSE body when a
   stream was requested, bodies that fail to decompress.
 - **Retries with bounded exponential backoff** — three attempts, 500 ms then

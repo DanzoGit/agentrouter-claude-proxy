@@ -24,6 +24,31 @@ def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+# Sentinel: drop a key from the base message entirely rather than overwrite it.
+DROP = object()
+
+
+def nonstream_message(**overrides):
+    """
+    A valid non-streaming Anthropic message, optionally broken in exactly one
+    way. Claude Code validates such a reply before using it and requires
+    content:array + model:string + usage:object, so each override below models
+    one shape it would reject.
+    """
+    base = {
+        "type": "message", "id": MSG_ID, "role": "assistant",
+        "model": "mock", "stop_reason": "end_turn", "stop_sequence": None,
+        "content": [{"type": "text", "text": "OK"}],
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    for key, value in overrides.items():
+        if value is DROP:
+            base.pop(key, None)
+        else:
+            base[key] = value
+    return base
+
+
 def valid_frames(with_tool: bool = False):
     yield sse("message_start", {
         "type": "message_start",
@@ -115,6 +140,68 @@ async def handler(request: Request, path: str):
             "stop_reason": "end_turn",
             "content": [{"type": "text", "text": "recovered"}],
             "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+
+    # ---- HTTP 200 bodies Claude Code's own validator rejects ---------------
+    # AgentRouter has been observed returning a "billing" block and no "usage"
+    # at all. Claude Code then rejects the reply as
+    # "API returned an empty or malformed response (HTTP 200)".
+    if scenario == "nonstream_no_usage":
+        return JSONResponse({
+            "type": "message",
+            "id": "msg_test",
+            "role": "assistant",
+            "model": "claude-opus-5",
+            "content": [{"type": "text", "text": "OK"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "billing": {"example": True},
+        })
+
+    if scenario == "nonstream_flaky_usage":
+        # First attempt omits usage; every later attempt is valid.
+        if n < 2:
+            return JSONResponse({
+                "type": "message", "id": "msg_test", "role": "assistant",
+                "model": "claude-opus-5",
+                "content": [{"type": "text", "text": "OK"}],
+                "stop_reason": "end_turn", "stop_sequence": None,
+                "billing": {"example": True},
+            })
+        return JSONResponse(nonstream_message(
+            content=[{"type": "text", "text": "recovered"}]))
+
+    if scenario == "nonstream_usage_not_object":
+        return JSONResponse(nonstream_message(usage="1 input token"))
+
+    if scenario == "nonstream_usage_null":
+        # typeof null === "object" in JavaScript, so Claude Code accepts this.
+        return JSONResponse(nonstream_message(usage=None))
+
+    if scenario == "nonstream_no_model":
+        return JSONResponse(nonstream_message(model=DROP))
+
+    if scenario == "nonstream_model_not_string":
+        return JSONResponse(nonstream_message(model=12345))
+
+    if scenario == "nonstream_content_string":
+        return JSONResponse(nonstream_message(content="OK"))
+
+    if scenario == "nonstream_content_object":
+        return JSONResponse(nonstream_message(
+            content={"type": "text", "text": "OK"}))
+
+    if scenario == "nonstream_no_content":
+        return JSONResponse(nonstream_message(content=DROP))
+
+    if scenario == "nonstream_empty_content":
+        return JSONResponse(nonstream_message(content=[]))
+
+    if scenario == "nonstream_error_object":
+        # A real upstream error delivered under HTTP 200.
+        return JSONResponse({
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": "upstream overloaded"},
         })
 
     if scenario == "gzip_bad":

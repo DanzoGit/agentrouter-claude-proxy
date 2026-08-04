@@ -647,17 +647,46 @@ def validate_json_response(status: int, body: bytes, is_messages: bool) -> tuple
         return False, "body_not_an_object"
 
     if "error" in data and data.get("type") == "error":
-        # A real upstream error delivered with a 200. Forward it -- do not
-        # dress it up as a success and do not retry a genuine rejection.
-        return True, "upstream_error_object"
+        # A real upstream error delivered with a 200. It is not retried -- a
+        # genuine rejection returns the same answer every time -- but it is not
+        # a usable message either, so it must not reach the client as a 200.
+        # The caller forwards this body verbatim under HTTP 502 so the
+        # upstream's own message survives.
+        return False, "upstream_error_object"
 
+    # Claude Code validates a non-streaming /v1/messages reply before using it
+    # and requires content:array + model:string + usage:object. Anything it
+    # would reject is rejected here too, so the request is retried while a
+    # clean retry is still possible instead of failing in the client as
+    # "empty or malformed response (HTTP 200)". Nothing is ever fabricated to
+    # make a body pass -- a missing field is a failure, not something to fill in.
     content = data.get("content")
     if content is None:
         bump("malformed_streams")
         return False, "missing_content_field"
-    if isinstance(content, list) and len(content) == 0:
+    if not isinstance(content, list):
+        bump("malformed_streams")
+        return False, "content_not_an_array"
+    if len(content) == 0:
         bump("empty_200_responses")
         return False, "empty_content_array"
+
+    if "model" not in data:
+        bump("malformed_streams")
+        return False, "missing_model_field"
+    if not isinstance(data["model"], str):
+        bump("malformed_streams")
+        return False, "model_not_a_string"
+
+    if "usage" not in data:
+        bump("malformed_streams")
+        return False, "missing_usage_field"
+    # Claude Code's test is `typeof usage === "object"`, which is also true for
+    # null in JavaScript, so a null usage is accepted here rather than retried.
+    # Being stricter than the client would reject replies it would have used.
+    if data["usage"] is not None and not isinstance(data["usage"], dict):
+        bump("malformed_streams")
+        return False, "usage_not_an_object"
 
     return True, "ok"
 
@@ -764,8 +793,11 @@ async def attempt_upstream(
     valid, reason = validate_json_response(status, raw, is_messages)
     if not valid:
         log(f"invalid response: {reason}")
-        return AttemptResult(ok=False, reason=reason, transient=True, status=status,
-                             body=raw, headers=response_headers)
+        # A genuine upstream error object is a real rejection, not a transport
+        # glitch -- retrying it only repeats the same answer.
+        return AttemptResult(ok=False, reason=reason,
+                             transient=reason != "upstream_error_object",
+                             status=status, body=raw, headers=response_headers)
 
     return AttemptResult(ok=True, reason=reason, status=status, body=raw,
                          headers=response_headers, is_sse=False)
@@ -1076,6 +1108,18 @@ async def proxy(request: Request, path: str) -> Response:
                 media_type=result.headers.get("content-type", "application/json"),
             )
 
+        # An upstream error object delivered under HTTP 200 is a real error
+        # message, so its text is forwarded verbatim -- but never under the 200
+        # that Claude Code would reject as malformed.
+        if result.reason == "upstream_error_object" and result.body:
+            log("final failure: upstream_error_object -- forwarding upstream "
+                "error body under HTTP 502")
+            return Response(
+                content=result.body,
+                status_code=502,
+                media_type=result.headers.get("content-type", "application/json"),
+            )
+
         if result.status == 200 and result.body:
             # Sanitized diagnostics: shape only, never forwarded to the client.
             log(f"discarding unusable HTTP 200 body "
@@ -1143,6 +1187,13 @@ def describe_failure(result: AttemptResult) -> str:
                   "empty_content_array", "missing_content_field"):
         return (f"AgentRouter returned HTTP 200 but never produced usable assistant "
                 f"content on any of {MAX_ATTEMPTS} attempts ({reason}).")
+    if reason in ("content_not_an_array", "missing_model_field", "model_not_a_string",
+                  "missing_usage_field", "usage_not_an_object"):
+        return (f"AgentRouter returned HTTP 200 with a body that is not a valid "
+                f"Anthropic message on all {MAX_ATTEMPTS} attempts ({reason}). "
+                f"Claude Code checks the same fields and would reject it as an "
+                f"empty or malformed response, so the proxy reports the failure "
+                f"instead of forwarding it. The missing field is not invented.")
     if reason.startswith("unparseable_json_body") or reason == "non_sse_for_stream_request":
         return (f"AgentRouter returned a malformed response on all {MAX_ATTEMPTS} "
                 f"attempts ({reason}).")
