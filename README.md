@@ -145,7 +145,7 @@ Clone the repository anywhere you like. Every script resolves its own paths, so
 no particular location is required.
 
 ```powershell
-git clone https://github.com/YOUR_USERNAME/agentrouter-claude-proxy.git
+git clone https://github.com/patraratorn/agentrouter-claude-proxy.git
 cd agentrouter-claude-proxy
 ```
 
