@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------------------
+# Secrets and local configuration -- never commit these.
+# ---------------------------------------------------------------------------
+.env
+.env.local
+.env.*.local
+
+# Claude Code settings hold your ANTHROPIC_AUTH_TOKEN.
+settings.json
+settings.json.backup*
+settings.local.json
+
+# ---------------------------------------------------------------------------
+# Runtime output. Proxy logs contain no credentials, prompts, or model output,
+# but they are machine-local noise and can reveal local paths.
+# ---------------------------------------------------------------------------
+logs/
+*.log
+*.log.*
+proxy-run*.log
+proxy-err*.log
+nohup.out
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------------------
+# Backups, scratch files, editor and OS clutter
+# ---------------------------------------------------------------------------
+*.backup
+*.backup-*
+*.bak
+*.tmp
+*.orig
+*.rej
+*~
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,5 @@
+# Minimum dependencies for the AgentRouter compatibility proxy.
+# Pinned exactly so behaviour cannot drift between installs.
+fastapi==0.115.6
+uvicorn==0.34.0
+httpx==0.28.1
