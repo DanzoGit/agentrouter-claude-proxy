@@ -64,6 +64,20 @@ CASES = [
     ("no usage once, then valid -> RECOVERS", "nonstream_flaky_usage", False, 200, 2, None, "recovered", False, 0),
     ("HTTP 200 error object -> 502, upstream message kept", "nonstream_error_object", False, 502, 1, None, None, False, 0),
     ("valid JSON as text/plain -> 200, relabelled application/json", "nonstream_text_plain", False, 200, 1, None, "OK", False, 0),
+    # --- trailing SSE frame at EOF ------------------------------------------
+    # A stream that ends without its final blank-line separator can leave one
+    # or more COMPLETE events in the buffer. Those must be forwarded. A tail
+    # that is genuinely incomplete must still be dropped.
+    ("trailing events glued at EOF -> message_stop forwarded", "tail_glued", True, 200, 1,
+     ["message_start", "content_block_start", "content_block_delta",
+      "content_block_delta", "content_block_stop", "message_delta",
+      "message_stop"], "OK", False, 0),
+    ("lone trailing message_stop, no final blank line", "tail_lone", True, 200, 1,
+     ["message_start", "content_block_start", "content_block_delta",
+      "content_block_delta", "content_block_stop", "message_delta",
+      "message_stop"], "OK", False, 0),
+    ("truncated trailing frame -> dropped, NOT repaired", "tail_truncated", True, 200, 1,
+     None, None, False, 1),
 ]
 
 
@@ -272,6 +286,66 @@ def main():
         print(f"[FAIL] JSON passthrough altered: status {r2.status_code}, "
               f"content-type {ct2}")
         failed += 1
+
+    # --- trailing SSE frame at EOF: exact counter behavior -------------------
+    # The production symptom was "dropped trailing SSE frame: type=message_stop"
+    # immediately followed by "post-commit failure: upstream closed after N
+    # frames without message_stop". A complete message_stop was being discarded
+    # because the tail held two glued events, so the client saw a truncation
+    # error at the end of an otherwise perfect response. These checks pin the
+    # counters, not just the status code.
+    print()
+    for scen, label, want_stop, want_pcf, want_drop in [
+        ("tail_glued", "glued trailing events at EOF", True, 0, 0),
+        ("tail_lone", "lone trailing message_stop at EOF", True, 0, 0),
+        ("tail_truncated", "truncated trailing frame (negative control)", False, 1, 1),
+        ("truncated_post", "real mid-stream truncation (must stay a failure)", False, 1, 0),
+    ]:
+        before = stats()
+        # These scenarios already ran once in CASES, so the mock's attempt
+        # counter is cumulative -- compare the delta, not the absolute.
+        att_before = httpx.get(f"{MOCK}/_mock_stats", timeout=10).json().get(scen, 0)
+        status, events, text, raw = consume(scen, True)
+        after = stats()
+        d_pcf = after.get("post_commit_failures", 0) - before.get("post_commit_failures", 0)
+        d_drop = after.get("dropped_sse_frames", 0) - before.get("dropped_sse_frames", 0)
+        attempts = (httpx.get(f"{MOCK}/_mock_stats", timeout=10).json().get(scen, 0)
+                    - att_before)
+        got_stop = "message_stop" in events
+        incomplete = "upstream_stream_incomplete" in raw
+
+        errs = []
+        if status != 200:
+            errs.append(f"status {status} != 200")
+        if got_stop != want_stop:
+            errs.append(f"message_stop forwarded={got_stop}, expected {want_stop}")
+        if d_pcf != want_pcf:
+            errs.append(f"post_commit_failures +{d_pcf}, expected +{want_pcf}")
+        if d_drop != want_drop:
+            errs.append(f"dropped_sse_frames +{d_drop}, expected +{want_drop}")
+        if want_stop and incomplete:
+            errs.append("emitted upstream_stream_incomplete despite a valid message_stop")
+        if not want_stop and not incomplete:
+            errs.append("no upstream_stream_incomplete error event on a real truncation")
+        # Nothing may be invented to make a stream look complete.
+        if not want_stop and '"type": "message_stop"' in raw.replace('"type":"message_stop"',
+                                                                    '"type": "message_stop"'):
+            errs.append("a message_stop appeared that upstream never completed -- synthesized")
+        if attempts != 1:
+            errs.append(f"upstream attempts {attempts} != 1 -- request was replayed after commit")
+
+        if errs:
+            print(f"[FAIL] {label}")
+            for e in errs:
+                print(f"       - {e}")
+            failed += 1
+        else:
+            print(f"[PASS] {label}")
+            print(f"       message_stop forwarded : {got_stop}")
+            print(f"       post_commit_failures   : +{d_pcf}")
+            print(f"       dropped_sse_frames     : +{d_drop}")
+            print(f"       upstream attempts      : {attempts} (no replay after commit)")
+            passed += 1
 
     print(f"\n{'=' * 64}\nscenario results: {passed} passed, {failed} failed")
     print("proxy counters:", json.dumps(

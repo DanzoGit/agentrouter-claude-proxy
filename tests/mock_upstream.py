@@ -312,6 +312,44 @@ async def handler(request: Request, path: str):
                             "error": {"type": "overloaded_error",
                                       "message": "upstream overloaded"}})
 
+    # ---- trailing-frame / EOF framing --------------------------------------
+    # Observed in production: a stream ends without its final blank-line
+    # separator, leaving one or more complete events in the parser buffer.
+
+    async def gen_tail_glued():
+        """
+        The production bug: the last two events arrive glued by a SINGLE
+        newline and the stream ends with no trailing blank line. Both are
+        complete and valid; parsed as one frame they are two JSON documents
+        joined by a newline, which does not parse.
+        """
+        frames = list(valid_frames())
+        for f in frames[:5]:          # through content_block_stop, well-formed
+            yield f
+        yield ('event: message_delta\n'
+               'data: {"type": "message_delta", "delta": {"stop_reason": "end_turn", '
+               '"stop_sequence": null}, "usage": {"output_tokens": 5}}\n'
+               'event: message_stop\n'
+               'data: {"type": "message_stop"}')
+
+    async def gen_tail_lone():
+        """A single complete message_stop with no trailing blank line."""
+        frames = list(valid_frames())
+        for f in frames[:6]:          # through message_delta, well-formed
+            yield f
+        yield 'event: message_stop\ndata: {"type": "message_stop"}'
+
+    async def gen_tail_truncated():
+        """
+        Negative control: the tail is genuinely incomplete -- the JSON payload
+        is cut mid-object. It must stay dropped and must never be repaired or
+        turned into a message_stop.
+        """
+        frames = list(valid_frames())
+        for f in frames[:5]:
+            yield f
+        yield 'event: message_stop\ndata: {"type": "message_st'
+
     streams = {
         "empty_sse": gen_empty_sse,
         "keepalive_only": gen_keepalive_only,
@@ -324,6 +362,9 @@ async def handler(request: Request, path: str):
         "valid_tool": gen_valid_tool,
         "slow_valid": gen_slow_valid,
         "error_event": gen_error_event,
+        "tail_glued": gen_tail_glued,
+        "tail_lone": gen_tail_lone,
+        "tail_truncated": gen_tail_truncated,
     }
 
     if scenario == "empty_body_stream":

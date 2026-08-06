@@ -300,6 +300,43 @@ class SSEFramer:
         return remainder if remainder.strip() else None
 
 
+def split_trailing_frames(remainder: str) -> list[str]:
+    """
+    Split an unterminated tail into the individual SSE events it contains.
+
+    A stream that ends without its final blank-line separator can leave more
+    than one complete event in the buffer, glued by a single newline:
+
+        event: message_delta
+        data: {"type": "message_delta", ...}
+        event: message_stop
+        data: {"type": "message_stop"}
+
+    Treated as one frame that is two JSON documents joined by a newline, which
+    does not parse -- so a complete, valid message_stop was dropped and the
+    stream was reported as having ended without one.
+
+    A new event starts at an `event:` line that follows a `data:` line; a raw
+    line can never begin with "event:" from inside a payload, because JSON
+    escapes newlines rather than emitting them literally. Multi-line `data:`
+    payloads stay with their own event.
+
+    This only separates candidates. Each one still goes through parse_frame and
+    drop_reason unchanged, so a genuinely truncated or malformed tail is
+    dropped exactly as before and nothing is ever synthesized.
+    """
+    frames: list[str] = []
+    current: list[str] = []
+    for line in remainder.split("\n"):
+        if line.startswith("event:") and any(l.startswith("data:") for l in current):
+            frames.append("\n".join(current))
+            current = []
+        current.append(line)
+    if current:
+        frames.append("\n".join(current))
+    return [f for f in frames if f.strip()]
+
+
 def encode_frame(text: str) -> bytes:
     """Re-attach the SSE separator and encode. The payload itself is untouched."""
     return (text.rstrip("\n") + SSEFramer.SEPARATOR).encode("utf-8")
@@ -963,7 +1000,12 @@ async def forward_stream(result: AttemptResult) -> AsyncIterator[bytes]:
 
         leftover = framer.flush()
         if leftover is not None:
-            yield leftover
+            # EOF without the final blank line. The tail may still hold one or
+            # more complete events -- typically the closing message_stop. Offer
+            # each to the same validation every other frame gets; an incomplete
+            # or malformed one is dropped there, as before.
+            for text in split_trailing_frames(leftover):
+                yield text
 
     source = frames()
     try:
