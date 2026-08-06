@@ -206,9 +206,9 @@ async def handler(request: Request, path: str):
 
     if scenario == "nonstream_text_plain":
         # HTTP 200, a structurally perfect Anthropic message, but served as
-        # text/plain -- the shape AgentRouter was observed using. The proxy
-        # accepts it (the JSON is valid) and forwards the content-type
-        # unchanged, so the client SDK never parses it.
+        # text/plain -- the shape AgentRouter was observed using. This
+        # deliberately models the upstream response that the proxy must relabel
+        # as application/json without changing the body bytes.
         return Response(content=json.dumps(nonstream_message()).encode(),
                         status_code=200,
                         media_type="text/plain; charset=utf-8")
