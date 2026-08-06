@@ -204,6 +204,15 @@ async def handler(request: Request, path: str):
             "error": {"type": "overloaded_error", "message": "upstream overloaded"},
         })
 
+    if scenario == "nonstream_text_plain":
+        # HTTP 200, a structurally perfect Anthropic message, but served as
+        # text/plain -- the shape AgentRouter was observed using. The proxy
+        # accepts it (the JSON is valid) and forwards the content-type
+        # unchanged, so the client SDK never parses it.
+        return Response(content=json.dumps(nonstream_message()).encode(),
+                        status_code=200,
+                        media_type="text/plain; charset=utf-8")
+
     if scenario == "gzip_bad":
         return Response(content=b"this is definitely not gzip", status_code=200,
                         headers={"content-encoding": "gzip"},

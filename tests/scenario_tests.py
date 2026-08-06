@@ -63,6 +63,7 @@ CASES = [
     ("empty content array -> existing behavior preserved", "nonstream_empty_content", False, 502, 3, None, None, False, 0),
     ("no usage once, then valid -> RECOVERS", "nonstream_flaky_usage", False, 200, 2, None, "recovered", False, 0),
     ("HTTP 200 error object -> 502, upstream message kept", "nonstream_error_object", False, 502, 1, None, None, False, 0),
+    ("valid JSON as text/plain -> 200, relabelled application/json", "nonstream_text_plain", False, 200, 1, None, "OK", False, 0),
 ]
 
 
@@ -197,6 +198,79 @@ def main():
         passed += 1
     else:
         print(f"[FAIL] null-field stripping\n       upstream saw: {keys}")
+        failed += 1
+
+    # --- Content-Type normalization -----------------------------------------
+    # AgentRouter serves some valid non-streaming messages as text/plain. The
+    # Anthropic SDK only calls response.json() when the content-type names JSON,
+    # so Claude Code's validator received a raw string and its first test,
+    # `typeof body === "object"`, failed -- a structurally perfect message was
+    # reported as "an empty or malformed response (HTTP 200)". The proxy now
+    # relabels such a response as application/json. Nothing else may change:
+    # this checks upstream really sent text/plain, that the body was already a
+    # valid Anthropic message, that we relabel it, and that not one byte of the
+    # body moved.
+    print()
+    body = {"model": "scenario:nonstream_text_plain", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}]}
+    # 1. straight from the mock upstream: what did AgentRouter actually send?
+    up = httpx.post(f"{MOCK}/v1/messages", headers=H, json=body, timeout=60)
+    up_ct = up.headers.get("content-type", "")
+    # 2. through the proxy
+    r = httpx.post(f"{PROXY}/v1/messages", headers=H, json=body, timeout=60)
+    out_ct_list = r.headers.get_list("content-type")
+    out_ct = r.headers.get("content-type", "")
+    parsed = r.json()
+    fields_ok = bool(isinstance(parsed.get("content"), list) and parsed["content"]
+                     and isinstance(parsed.get("model"), str)
+                     and isinstance(parsed.get("usage"), dict))
+
+    errs = []
+    if "text/plain" not in up_ct.lower():
+        errs.append(f"mock upstream content-type {up_ct!r} is not text/plain -- "
+                    f"this test no longer models the observed failure")
+    if r.status_code != up.status_code or r.status_code != 200:
+        errs.append(f"status {r.status_code} != upstream {up.status_code} (expected 200)")
+    if not fields_ok:
+        errs.append("body is not a structurally valid Anthropic message")
+    if "application/json" not in out_ct.lower():
+        errs.append(f"outgoing content-type {out_ct!r} is not application/json -- "
+                    f"the SDK will not parse it")
+    if len(out_ct_list) != 1:
+        errs.append(f"{len(out_ct_list)} content-type headers on the wire: {out_ct_list}")
+    if r.content != up.content:
+        errs.append(f"body bytes changed: {len(up.content)} upstream -> "
+                    f"{len(r.content)} downstream")
+    if errs:
+        print("[FAIL] text/plain -> application/json normalization")
+        for e in errs:
+            print(f"       - {e}")
+        failed += 1
+    else:
+        print("[PASS] valid JSON served as text/plain is relabelled application/json, "
+              "body byte-identical")
+        print(f"       upstream content-type   : {up_ct}")
+        print(f"       outgoing content-type   : {out_ct}  ({len(out_ct_list)} header)")
+        print(f"       body structurally valid : {fields_ok} "
+              f"(content:array, model:str, usage:object all present)")
+        print(f"       body bytes              : {len(up.content)} upstream == "
+              f"{len(r.content)} downstream, identical: {r.content == up.content}")
+        print(f"       SDK would JSON-parse    : True  <-- FKu now receives an object")
+        passed += 1
+
+    # A JSON content-type must be forwarded untouched -- normalization applies
+    # only when the upstream header would defeat the client's parser.
+    r2 = httpx.post(f"{PROXY}/v1/messages", headers=H,
+                    json={"model": "scenario:nonstream_valid", "max_tokens": 64,
+                          "messages": [{"role": "user", "content": "hi"}]},
+                    timeout=60)
+    ct2 = r2.headers.get_list("content-type")
+    if len(ct2) == 1 and "application/json" in ct2[0].lower() and r2.status_code == 200:
+        print("[PASS] already-JSON content-type passes through untouched, single header")
+        passed += 1
+    else:
+        print(f"[FAIL] JSON passthrough altered: status {r2.status_code}, "
+              f"content-type {ct2}")
         failed += 1
 
     print(f"\n{'=' * 64}\nscenario results: {passed} passed, {failed} failed")

@@ -233,6 +233,29 @@ def preview(body: bytes, limit: int = 160) -> str:
     return f"<non-json {len(body)}B: {collapsed[:limit]!r}>"
 
 
+def body_parses_as_json(body: bytes) -> bool:
+    """Diagnostic: does this body parse as JSON at all? Shape only, no content."""
+    try:
+        json.loads((body or b"").decode("utf-8"))
+        return True
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return False
+
+
+def client_will_json_parse(content_type: str) -> bool:
+    """
+    Mirror the Anthropic SDK's decision to call response.json().
+
+    The SDK gates parsing on the content-type naming JSON; for anything else it
+    hands the caller the raw text. Claude Code then runs a validator that begins
+    with `typeof body === "object"`, so a perfectly valid message served as
+    text/plain is rejected as an "empty or malformed response". This is a
+    diagnostic only -- nothing is rewritten on the basis of it.
+    """
+    ct = (content_type or "").lower()
+    return "application/json" in ct or "+json" in ct
+
+
 # ----------------------------------------------------------------------------
 # SSE framing
 # ----------------------------------------------------------------------------
@@ -1150,18 +1173,57 @@ async def proxy(request: Request, path: str) -> Response:
         )
 
     # ---- Success: non-streaming (incl. forwarded 4xx) -----------------------
+    normalize_content_type = False
     if result.status == 200:
         bump("successful_requests")
         log(f"non-stream response OK ({len(result.body or b'')} bytes)")
+        if is_messages:
+            # Diagnostic only: headers and shape, never body content. Records
+            # whether the client's SDK will actually JSON-parse what we forward.
+            # If it will not, Claude Code's validator sees a string instead of
+            # an object and rejects a structurally perfect message.
+            upstream_ct = result.headers.get("content-type", "<none>")
+            outgoing_ct = result.headers.get("content-type", "application/json")
+            json_parsed = body_parses_as_json(result.body)
+            log(f"non-stream diagnostics: "
+                f"upstream_content_type={upstream_ct} "
+                f"json_parsed={json_parsed} "
+                f"validation={result.reason} "
+                f"outgoing_content_type={outgoing_ct} "
+                f"client_will_json_parse={client_will_json_parse(outgoing_ct)} "
+                f"bytes={len(result.body or b'')}")
+            # A body only reaches here by passing validate_json_response, so it
+            # is a well-formed Anthropic message. AgentRouter has been observed
+            # serving such a message as text/plain; the Anthropic SDK then skips
+            # response.json() and hands Claude Code a raw string, whose
+            # validator fails on `typeof body === "object"` and reports "an
+            # empty or malformed response (HTTP 200)". Relabel it. Only the
+            # header changes -- the body bytes are forwarded untouched.
+            normalize_content_type = json_parsed and not client_will_json_parse(outgoing_ct)
     else:
         bump("failed_requests")
         log(f"forwarding upstream HTTP {result.status} verbatim ({result.reason})")
 
+    out_headers = passthrough_headers(result.headers)
+    media_type = result.headers.get("content-type", "application/json")
+    if normalize_content_type:
+        # Starlette ignores media_type entirely when the headers mapping already
+        # carries a content-type, so the upstream value has to be dropped here
+        # rather than overridden below. Removing it case-insensitively also
+        # collapses any duplicate the upstream may have sent, which guarantees
+        # exactly one content-type on the wire.
+        out_headers = {k: v for k, v in out_headers.items()
+                       if k.lower() != "content-type"}
+        media_type = "application/json"
+        log(f"content-type normalized for client SDK: "
+            f"{result.headers.get('content-type', '<none>')} -> application/json "
+            f"(body unchanged, {len(result.body or b'')} bytes)")
+
     return Response(
         content=result.body or b"",
         status_code=result.status,
-        headers=passthrough_headers(result.headers),
-        media_type=result.headers.get("content-type", "application/json"),
+        headers=out_headers,
+        media_type=media_type,
     )
 
 
