@@ -76,7 +76,7 @@ $trigger.Delay = "PT${DelaySeconds}S"
 
 # RunLevel Limited: no elevation. A loopback listener does not need admin, and
 # the proxy must run as the same user whose Claude Code config it serves.
-$principal = New-ScheduledTaskPrincipal -UserId $account -LogonType InteractiveToken -RunLevel Limited
+$principal = New-ScheduledTaskPrincipal -UserId $account -LogonType Interactive -RunLevel Limited
 
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `

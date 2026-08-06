@@ -66,6 +66,46 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'py_compile failed' }
     Write-Host '[ ok  ] all sources compile' -ForegroundColor Green
 
+    # ---- 1b. PowerShell scripts: parse + scheduled-task enum values -------
+    # Static only: nothing is registered and no existing task is touched.
+    # The principal's LogonType value "InteractiveToken" (issue #1) parsed
+    # fine but was rejected at runtime by the ScheduledTasks module, so
+    # install-autostart.ps1 failed at the point of use. Check every
+    # enum-valued argument against the live enum instead.
+    Write-Host "`n[test ] validating PowerShell scripts" -ForegroundColor Cyan
+    $psFiles = @(Get-ChildItem -Path $root -Filter '*.ps1' -File) +
+               @(Get-ChildItem -Path $here -Filter '*.ps1' -File)
+    foreach ($f in $psFiles) {
+        $perrs = $null
+        [System.Management.Automation.Language.Parser]::ParseFile(
+            $f.FullName, [ref]$null, [ref]$perrs) | Out-Null
+        if ($perrs) { throw "$($f.Name): $($perrs[0].Message)" }
+    }
+    Write-Host "[ ok  ] $($psFiles.Count) PowerShell scripts parse cleanly" -ForegroundColor Green
+
+    $enumParams = @{
+        LogonType = 'New-ScheduledTaskPrincipal'
+        RunLevel  = 'New-ScheduledTaskPrincipal'
+    }
+    $checked = 0
+    foreach ($param in $enumParams.Keys) {
+        $cmd = Get-Command $enumParams[$param] -ErrorAction SilentlyContinue
+        if (-not $cmd) { continue }   # module unavailable: skip, do not fail
+        $valid = [enum]::GetNames($cmd.Parameters[$param].ParameterType)
+        foreach ($f in $psFiles) {
+            foreach ($m in ([regex]"-$param\s+([A-Za-z]+)").Matches(
+                            (Get-Content $f.FullName -Raw))) {
+                $used = $m.Groups[1].Value
+                if ($valid -notcontains $used) {
+                    throw ("$($f.Name): -$param $used is not a valid value on " +
+                           "this system. Valid: $($valid -join ', ')")
+                }
+                $checked++
+            }
+        }
+    }
+    Write-Host "[ ok  ] $checked scheduled-task enum arguments valid on this system" -ForegroundColor Green
+
     # ---- 2. start the mock upstream --------------------------------------
     $mockProc = Start-Process -FilePath $python -PassThru -WindowStyle Hidden `
         -WorkingDirectory $here `
