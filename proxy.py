@@ -43,6 +43,7 @@ import codecs
 import json
 import os
 import time
+from email.utils import parsedate_tz
 from typing import Any, AsyncIterator, Iterable, Optional
 
 import httpx
@@ -74,6 +75,12 @@ READ_TIMEOUT_S = float(os.environ.get("PROXY_READ_TIMEOUT_S", "600"))
 
 VERBOSE = os.environ.get("PROXY_VERBOSE", "0") not in ("0", "", "false", "False")
 
+# Advertised to the client when the upstream rate-limits us but sends no
+# Retry-After of its own. Without a hint the Anthropic SDK schedules its next
+# attempt immediately -- the "Retrying in 0s" the terminal reports -- which
+# hammers an upstream that is already out of capacity.
+DEFAULT_RETRY_AFTER_S = int(os.environ.get("PROXY_RETRY_AFTER_S", "15"))
+
 # ----------------------------------------------------------------------------
 # Anthropic SSE vocabulary
 # ----------------------------------------------------------------------------
@@ -97,6 +104,19 @@ COMMIT_EVENTS = {"content_block_start", "content_block_delta"}
 # Non-Anthropic bookkeeping frames some gateways interleave. Claude Code cannot
 # parse them; they are dropped (type is logged, payload is not).
 JUNK_TYPE_MARKERS = ("billing", "usage_summary", "credit", "quota", "balance")
+
+# The wording upstream uses when every provider behind it is busy. Matched only
+# against an error envelope's own message fields -- never against assistant
+# content -- so a reply that merely discusses saturation cannot be mistaken for
+# one. Recognition is diagnostic: the status, the body and the retry decision
+# are identical whether or not a 429 matches.
+SATURATION_MARKERS = (
+    "all providers are saturated",
+    "providers are saturated",
+    "no available provider",
+    "provider capacity",
+    "all channels are busy",
+)
 
 # Top-level request fields that upstream schema validation rejects when
 # explicitly null. Only these exact keys are stripped, and only at the top
@@ -157,6 +177,19 @@ STATS: dict[str, int] = {
     "post_commit_failures": 0,
     "client_disconnects": 0,
     "failed_requests": 0,
+    # 4xx broken out by kind. upstream_4xx above stays the aggregate.
+    "upstream_400": 0,
+    "upstream_401": 0,
+    "upstream_403": 0,
+    "upstream_429": 0,
+    "upstream_429_saturated": 0,
+    "upstream_other_4xx": 0,
+    "retry_after_added": 0,
+    # Reserved: no upstream status other than 429 is known to be a retryable
+    # rate limit, so nothing is ever converted. Exposed so a future signature
+    # can be counted without changing the shape of /_stats.
+    "rate_limit_converted": 0,
+    "effort_thinking_validation_errors": 0,
 }
 
 _STARTED_AT = time.time()
@@ -794,6 +827,7 @@ async def attempt_upstream(
         response_headers = dict(response.headers)
         await close_quietly(response, client)
         bump("upstream_4xx")
+        classify_client_error(status, raw)
         log(f"authentication/permission failure from upstream (HTTP {status}) -- "
             f"not retrying, not bypassing")
         return AttemptResult(ok=True, reason="auth_failure", status=status,
@@ -818,6 +852,7 @@ async def attempt_upstream(
         raw = await read_body_safe(response)
         response_headers = dict(response.headers)
         await close_quietly(response, client)
+        classify_client_error(status, raw)
         return AttemptResult(ok=True, reason=f"http_{status}", status=status, body=raw,
                              headers=response_headers, is_sse=False)
 
@@ -879,6 +914,142 @@ async def read_body_safe(response: httpx.Response) -> bytes:
     except (httpx.HTTPError, OSError) as exc:
         log(f"upstream body read failed ({type(exc).__name__}) -- treating as invalid")
         return b""
+
+
+def upstream_error_text(body: bytes) -> str:
+    """
+    The upstream error envelope's own wording, lowercased and concatenated.
+
+    Only the fields of a JSON *error object* are read. Assistant content is
+    never inspected, so a reply that happens to discuss rate limits or
+    saturation can never be classified as one.
+    """
+    try:
+        data = json.loads((body or b"").decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+
+    parts: list[str] = []
+    err = data.get("error")
+    if isinstance(err, dict):
+        for key in ("message", "type", "code", "rule_id", "detail", "param"):
+            value = err.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+    elif isinstance(err, str):
+        parts.append(err)
+    for key in ("message", "detail", "rule_id"):
+        value = data.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+    return " ".join(parts).lower()
+
+
+def is_saturation(body: bytes) -> bool:
+    """Whether a 429 carries the upstream's provider-capacity wording."""
+    text = upstream_error_text(body)
+    return any(marker in text for marker in SATURATION_MARKERS)
+
+
+def is_effort_thinking_error(body: bytes) -> bool:
+    """
+    Recognise the permanent 400 that rejects output_config.effort unless
+    thinking is enabled. Retrying a schema rejection only repeats it, and
+    converting it into a 429 would hide a real client/upstream incompatibility
+    behind an infinite retry loop -- so this is recorded and forwarded, never
+    acted on.
+    """
+    text = upstream_error_text(body)
+    if "claude_effort_requires_thinking" in text:
+        return True
+    return "output_config.effort" in text and "thinking" in text
+
+
+def retry_after_is_usable(value: Optional[str]) -> bool:
+    """
+    Whether an upstream Retry-After can be forwarded untouched. Both RFC 9110
+    forms count: delta-seconds, and an HTTP-date.
+    """
+    if not value:
+        return False
+    raw = value.strip()
+    try:
+        return int(raw) >= 0
+    except ValueError:
+        return parsedate_tz(raw) is not None
+
+
+def classify_client_error(status: int, body: bytes) -> None:
+    """
+    Record what kind of 4xx arrived. Counters and log lines only -- the status
+    code, the body bytes and the (non-)retry decision are all left exactly as
+    they were.
+    """
+    if status == 400:
+        bump("upstream_400")
+        if is_effort_thinking_error(body):
+            bump("effort_thinking_validation_errors")
+            log("upstream rejected output_config.effort because thinking is not "
+                "enabled (claude_effort_requires_thinking) -- permanent schema "
+                "error, forwarded unchanged and never retried")
+    elif status == 401:
+        bump("upstream_401")
+    elif status == 403:
+        bump("upstream_403")
+    elif status == 429:
+        bump("upstream_429")
+        if is_saturation(body):
+            bump("upstream_429_saturated")
+            log("upstream reports provider saturation (HTTP 429) -- forwarding "
+                "the real 429; the client owns the retry schedule")
+    else:
+        bump("upstream_other_4xx")
+
+
+def describe_request_shape(body: bytes) -> str:
+    """
+    Structural summary of an outgoing request, for diagnosing schema rejections
+    like claude_effort_requires_thinking.
+
+    Field NAMES and small enum values only. Prompt text, system prompt, tool
+    names, tool arguments, tool results, thinking text, file paths and the raw
+    body are excluded by construction: nothing below reads a value that could
+    carry user content.
+    """
+    try:
+        data = json.loads((body or b"").decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return "unparseable"
+    if not isinstance(data, dict):
+        return "not_a_json_object"
+
+    model = data.get("model")
+    parts = [
+        f"model={model if isinstance(model, str) else '<none>'}",
+        f"stream={data.get('stream') is True}",
+        f"top_level_keys={','.join(sorted(data.keys()))}",
+        f"thinking_present={'thinking' in data}",
+    ]
+
+    thinking = data.get("thinking")
+    if isinstance(thinking, dict):
+        t_type = thinking.get("type")
+        parts.append(
+            f"thinking.type={t_type if isinstance(t_type, str) else '<non-string>'}")
+        parts.append(f"thinking.budget_tokens_present={'budget_tokens' in thinking}")
+
+    parts.append(f"output_config_present={'output_config' in data}")
+    output_config = data.get("output_config")
+    if isinstance(output_config, dict):
+        parts.append(
+            f"output_config_keys={','.join(sorted(output_config.keys()))}")
+        parts.append(f"output_config.effort_present={'effort' in output_config}")
+        effort = output_config.get("effort")
+        if isinstance(effort, str):
+            parts.append(f"output_config.effort={effort}")
+    return " ".join(parts)
 
 
 def classify_503(body: bytes) -> str:
@@ -1137,6 +1308,11 @@ async def proxy(request: Request, path: str) -> Response:
         f"-> {url}  stream={stream_requested}")
     if stripped:
         log(f"stripped null request fields: {', '.join(stripped)}")
+    if is_messages:
+        # Structure only -- see describe_request_shape. This is what makes a
+        # schema rejection like claude_effort_requires_thinking diagnosable
+        # without ever recording a prompt, a tool, or a body.
+        log(f"request shape: {describe_request_shape(body)}")
 
     headers = build_upstream_headers(dict(request.headers))
     if VERBOSE:
@@ -1248,6 +1424,26 @@ async def proxy(request: Request, path: str) -> Response:
 
     out_headers = passthrough_headers(result.headers)
     media_type = result.headers.get("content-type", "application/json")
+
+    # A 429 with no Retry-After leaves the SDK to pick its own delay, and Claude
+    # Code then reschedules immediately -- the "Retrying in 0s" seen in the
+    # terminal -- which hammers an upstream that is already out of capacity.
+    # Supplying the missing hint is the whole fix: the status code and every
+    # body byte are forwarded exactly as the upstream sent them, and the client
+    # still owns the retry loop.
+    if result.status == 429:
+        upstream_hint = next((v for k, v in out_headers.items()
+                              if k.lower() == "retry-after"), None)
+        if retry_after_is_usable(upstream_hint):
+            log(f"preserving upstream Retry-After: {upstream_hint}")
+        else:
+            out_headers = {k: v for k, v in out_headers.items()
+                           if k.lower() != "retry-after"}
+            out_headers["retry-after"] = str(DEFAULT_RETRY_AFTER_S)
+            bump("retry_after_added")
+            log(f"upstream 429 carried no usable Retry-After -- advertising "
+                f"{DEFAULT_RETRY_AFTER_S}s so the client backs off")
+
     if normalize_content_type:
         # Starlette ignores media_type entirely when the headers mapping already
         # carries a content-type, so the upstream value has to be dropped here

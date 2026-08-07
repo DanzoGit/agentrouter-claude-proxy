@@ -235,6 +235,60 @@ async def handler(request: Request, path: str):
                                         "message": "max_tokens is required"}},
             status_code=400)
 
+    # ---- rate limiting / capacity ------------------------------------------
+    # The observed saturation shape: a real 429, and no Retry-After at all. The
+    # missing header is what makes Claude Code reschedule immediately.
+    if scenario == "http_429_saturated":
+        return JSONResponse(
+            {"type": "error", "error": {"type": "rate_limit_error",
+                                        "message": "All providers are saturated; "
+                                                   "retry shortly"}},
+            status_code=429)
+
+    if scenario == "http_429_saturated_hint":
+        # Same failure, but upstream supplies its own delay. It must survive.
+        return JSONResponse(
+            {"type": "error", "error": {"type": "rate_limit_error",
+                                        "message": "All providers are saturated; "
+                                                   "retry shortly"}},
+            status_code=429, headers={"retry-after": "42"})
+
+    if scenario == "http_429_plain":
+        # An ordinary per-key rate limit: still a 429, but not saturation.
+        return JSONResponse(
+            {"type": "error", "error": {"type": "rate_limit_error",
+                                        "message": "rate limit exceeded for this key"}},
+            status_code=429)
+
+    # ---- permanent 4xx that must never be converted or retried --------------
+    if scenario == "http_400_effort_thinking":
+        return JSONResponse(
+            {"type": "error",
+             "error": {"type": "invalid_request_error",
+                       "message": "output_config.effort: requires thinking.type "
+                                  "to be enabled",
+                       "rule_id": "claude_effort_requires_thinking"}},
+            status_code=400)
+
+    if scenario == "http_400_content_blocked":
+        return JSONResponse(
+            {"type": "error", "error": {"type": "invalid_request_error",
+                                        "message": "content blocked by policy"}},
+            status_code=400)
+
+    if scenario == "http_403_model":
+        return JSONResponse(
+            {"type": "error", "error": {"type": "permission_error",
+                                        "message": "not authorized to access model"}},
+            status_code=403)
+
+    # A model reply that merely *discusses* saturation. Structural matching must
+    # not mistake assistant content for a capacity failure.
+    if scenario == "nonstream_talks_about_saturation":
+        return JSONResponse(nonstream_message(content=[
+            {"type": "text",
+             "text": "When all providers are saturated you should back off."}]))
+
     # ---- streaming scenarios ----------------------------------------------
     async def gen_empty_sse():
         return
