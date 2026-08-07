@@ -274,6 +274,23 @@ async def handler(request: Request, path: str):
         return JSONResponse(
             {"type": "error", "error": {"type": "invalid_request_error",
                                         "message": "content blocked by policy"}},
+            status_code=400,
+            headers={"request-id": "req_mock_blocked_001"})
+
+    # The shape Claude Code actually renders as "API Error: 400 content-blocked":
+    # a bare token, not a JSON error envelope. Detection must survive it, and the
+    # body must still reach the client byte-for-byte.
+    if scenario == "http_400_content_blocked_bare":
+        return Response(content=b"content-blocked", status_code=400,
+                        media_type="text/plain",
+                        headers={"request-id": "req_mock_blocked_002"})
+
+    # A 400 that merely mentions moderation in passing is a different failure and
+    # must not be classified as content-blocked.
+    if scenario == "http_400_other":
+        return JSONResponse(
+            {"type": "error", "error": {"type": "invalid_request_error",
+                                        "message": "max_tokens must be positive"}},
             status_code=400)
 
     if scenario == "http_403_model":
@@ -288,6 +305,15 @@ async def handler(request: Request, path: str):
         return JSONResponse(nonstream_message(content=[
             {"type": "text",
              "text": "When all providers are saturated you should back off."}]))
+
+    # The same trap for moderation: an ordinary HTTP 200 answer that quotes the
+    # exact wording of a rejection. Classifying this would let the model's own
+    # output fabricate a moderation event.
+    if scenario == "nonstream_says_content_blocked":
+        return JSONResponse(nonstream_message(content=[
+            {"type": "text",
+             "text": "If you see API Error: 400 content-blocked, the upstream "
+                     "content_filter rejected the request."}]))
 
     # ---- streaming scenarios ----------------------------------------------
     async def gen_empty_sse():

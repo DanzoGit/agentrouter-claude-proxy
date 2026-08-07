@@ -500,6 +500,374 @@ def main():
         print(f"       logged for the reject  : {rejected_shape}")
         passed += 1
 
+    # --- content-blocked: classification, preservation, recovery -------------
+    # The production symptom is Claude Code showing "API Error: 400
+    # content-blocked" mid-session. That is a real AgentRouter moderation
+    # decision, so the entire job here is to NOT interfere with it: keep the
+    # 400, keep every body byte, never retry, never convert -- while recording
+    # enough content-free structure to say where the conversation was when it
+    # happened. These checks pin both halves.
+    print()
+    for scen, label, want_ct_count in [
+        ("http_400_content_blocked", "400 content-blocked (JSON envelope)", 1),
+        ("http_400_content_blocked_bare", "400 content-blocked (bare token body)", 1),
+        ("http_400_other", "400 unrelated schema error is NOT content-blocked", 0),
+        ("http_400_effort_thinking", "400 effort/thinking is NOT content-blocked", 0),
+        ("http_429_saturated", "429 saturated is NOT content-blocked", 0),
+        ("http_401", "401 auth is NOT content-blocked", 0),
+        ("http_403_model", "403 model access is NOT content-blocked", 0),
+    ]:
+        req = {"model": f"scenario:{scen}", "max_tokens": 16,
+               "messages": [{"role": "user", "content": "hi"}]}
+        before = stats()
+        att_before = httpx.get(f"{MOCK}/_mock_stats", timeout=10).json().get(scen, 0)
+        r = httpx.post(f"{PROXY}/v1/messages", headers=H, json=req, timeout=60)
+        after = stats()
+        attempts = (httpx.get(f"{MOCK}/_mock_stats", timeout=10).json().get(scen, 0)
+                    - att_before)
+        direct = httpx.post(f"{MOCK}/v1/messages", json=req, timeout=30)
+        d = {k: after.get(k, 0) - before.get(k, 0) for k in (
+            "upstream_400_content_blocked", "content_blocked_events",
+            "retry_after_added", "retries", "rate_limit_converted")}
+
+        errs = []
+        if r.status_code != direct.status_code:
+            errs.append(f"status {r.status_code} != upstream {direct.status_code}")
+        if r.content != direct.content:
+            errs.append("body was not forwarded byte-for-byte")
+        if d["upstream_400_content_blocked"] != want_ct_count:
+            errs.append(f"upstream_400_content_blocked +{d['upstream_400_content_blocked']}, "
+                        f"expected +{want_ct_count}")
+        if d["content_blocked_events"] != want_ct_count:
+            errs.append(f"content_blocked_events +{d['content_blocked_events']}, "
+                        f"expected +{want_ct_count}")
+        if attempts != 1:
+            errs.append(f"upstream attempts {attempts} != 1 -- the request was retried")
+        if d["retries"] != 0:
+            errs.append(f"retries +{d['retries']} -- content-blocked must never be retried")
+        if d["rate_limit_converted"] != 0:
+            errs.append("status was converted -- a 400 must stay a 400")
+        # Only a 429 ever gets a Retry-After; a moderation 400 must not look
+        # retryable, or Claude Code's retry loop would replay a hard rejection.
+        if want_ct_count and r.headers.get("retry-after") is not None:
+            errs.append(f"Retry-After {r.headers.get('retry-after')!r} injected on a 400")
+        if want_ct_count and d["retry_after_added"] != 0:
+            errs.append(f"retry_after_added +{d['retry_after_added']} on a 400")
+
+        if errs:
+            print(f"[FAIL] {label}")
+            for e in errs:
+                print(f"       - {e}")
+            failed += 1
+        else:
+            print(f"[PASS] {label}")
+            print(f"       status                 : {r.status_code} (upstream "
+                  f"{direct.status_code}, preserved)")
+            print(f"       body byte-identical    : True ({len(r.content)} bytes)")
+            print(f"       classified as blocked  : +{d['upstream_400_content_blocked']}")
+            print(f"       attempts / retries     : {attempts} / +{d['retries']} "
+                  f"(never retried)")
+            passed += 1
+
+    # Claude Code's watchdog is configured for up to 30 retries. That loop must
+    # never be handed a moderation rejection: the proxy answers a content-blocked
+    # 400 on the first attempt, with no Retry-After to schedule against.
+    print()
+    att_before = httpx.get(f"{MOCK}/_mock_stats", timeout=10).json().get(
+        "http_400_content_blocked_bare", 0)
+    rb = httpx.post(f"{PROXY}/v1/messages", headers=H,
+                    json={"model": "scenario:http_400_content_blocked_bare",
+                          "max_tokens": 16,
+                          "messages": [{"role": "user", "content": "hi"}]}, timeout=60)
+    att_after = httpx.get(f"{MOCK}/_mock_stats", timeout=10).json().get(
+        "http_400_content_blocked_bare", 0)
+    errs = []
+    if att_after - att_before != 1:
+        errs.append(f"upstream saw {att_after - att_before} attempts, expected exactly 1")
+    if rb.headers.get("retry-after") is not None:
+        errs.append("Retry-After present -- the SDK would schedule a retry")
+    if rb.status_code != 400:
+        errs.append(f"status {rb.status_code} != 400")
+    if errs:
+        print("[FAIL] content-blocked never enters the retry loop")
+        for e in errs:
+            print(f"       - {e}")
+        failed += 1
+    else:
+        print("[PASS] content-blocked never enters the retry loop "
+              "(CLAUDE_CODE_MAX_RETRIES=30 is not engaged)")
+        print(f"       upstream attempts      : {att_after - att_before} of a possible 30")
+        print(f"       Retry-After            : {rb.headers.get('retry-after')!r} "
+              f"(nothing to schedule against)")
+        passed += 1
+
+    # --- recovery checkpoints: growth, lanes, bounds, and blocked matching ----
+    # A checkpoint is written only when upstream ACCEPTS a turn, so it records
+    # the last state known to be acceptable. These checks drive real traffic
+    # through the proxy and read the result back from /_recovery.
+    print()
+
+    def recovery():
+        return httpx.get(f"{PROXY}/_recovery", timeout=10).json()
+
+    def turn(n_messages, scen="nonstream_valid", session=None, tag="hi"):
+        """One /v1/messages call with a conversation of n_messages messages."""
+        msgs = []
+        for i in range(n_messages):
+            msgs.append({"role": "user" if i % 2 == 0 else "assistant",
+                         "content": f"{tag} {i}"})
+        hdrs = dict(H)
+        if session:
+            hdrs["x-session-id"] = session
+        return httpx.post(f"{PROXY}/v1/messages", headers=hdrs,
+                          json={"model": f"scenario:{scen}", "max_tokens": 16,
+                                "messages": msgs}, timeout=60)
+
+    before = stats()
+    turn(3, session="sess-alpha")
+    turn(5, session="sess-alpha")          # alpha grows
+    turn(7, session="sess-beta")           # a concurrent conversation
+    after = stats()
+    rec = recovery()
+    saved = after.get("recovery_checkpoints_saved", 0) - before.get(
+        "recovery_checkpoints_saved", 0)
+
+    errs = []
+    if saved != 3:
+        errs.append(f"recovery_checkpoints_saved +{saved}, expected +3")
+    if rec.get("last_good", {}).get("message_count") != 7:
+        errs.append(f"last_good message_count "
+                    f"{rec.get('last_good', {}).get('message_count')} != 7")
+    if rec.get("last_good", {}).get("session_id") != "sess-beta":
+        errs.append(f"last_good session {rec.get('last_good', {}).get('session_id')!r} "
+                    f"!= 'sess-beta' -- lanes overwrote each other")
+    if rec.get("status") not in ("ready", "content_blocked"):
+        errs.append(f"status {rec.get('status')!r} unexpected after successful turns")
+    if errs:
+        print("[FAIL] successful turns create per-lane last-good checkpoints")
+        for e in errs:
+            print(f"       - {e}")
+        failed += 1
+    else:
+        print("[PASS] successful turns create per-lane last-good checkpoints")
+        print(f"       checkpoints saved      : +{saved} (3 turns, 2 conversations)")
+        print(f"       last good              : {rec['last_good']['message_count']} messages, "
+              f"lane={rec['last_good']['lane_kind']}")
+        passed += 1
+
+    # A blocked request must be matched against ITS OWN lane's last-good turn,
+    # not merely the most recent one globally.
+    turn(9, session="sess-alpha")                     # alpha's last good = 9
+    turn(11, session="sess-beta")                     # beta is more recent
+    blocked = turn(13, scen="http_400_content_blocked", session="sess-alpha")
+    rec = recovery()
+    lb = rec.get("last_blocked") or {}
+    lg = rec.get("last_good") or {}
+
+    errs = []
+    if blocked.status_code != 400:
+        errs.append(f"blocked status {blocked.status_code} != 400")
+    if rec.get("status") != "content_blocked":
+        errs.append(f"/_recovery status {rec.get('status')!r} != 'content_blocked'")
+    if lb.get("blocked_message_count") != 13:
+        errs.append(f"blocked_message_count {lb.get('blocked_message_count')} != 13")
+    if lb.get("last_good_message_count") != 9:
+        errs.append(f"last_good_message_count {lb.get('last_good_message_count')} != 9 "
+                    f"-- matched the wrong lane")
+    if lg.get("message_count") != 9:
+        errs.append(f"last_good served {lg.get('message_count')} != 9 -- /_recovery "
+                    f"did not report the blocked lane's checkpoint")
+    if lb.get("session_id") != "sess-alpha":
+        errs.append(f"blocked session {lb.get('session_id')!r} != 'sess-alpha'")
+    if not lb.get("structural_change"):
+        errs.append("structural_change=False despite 9 -> 13 messages")
+    if lb.get("proxy_retry") is not False:
+        errs.append(f"proxy_retry {lb.get('proxy_retry')!r} -- must be False")
+    if lb.get("request_modified") is not False:
+        errs.append(f"request_modified {lb.get('request_modified')!r} -- must be False")
+    if lb.get("upstream_request_id") != "req_mock_blocked_001":
+        errs.append(f"upstream_request_id {lb.get('upstream_request_id')!r} not captured")
+    if errs:
+        print("[FAIL] a blocked request finds its own lane's last-good checkpoint")
+        for e in errs:
+            print(f"       - {e}")
+        failed += 1
+    else:
+        print("[PASS] a blocked request finds its own lane's last-good checkpoint")
+        print(f"       last good / blocked    : {lb['last_good_message_count']} -> "
+              f"{lb['blocked_message_count']} messages (own lane, not the newest)")
+        print(f"       structural change      : {lb['structural_change']}")
+        print(f"       proxy retried/modified : {lb['proxy_retry']} / {lb['request_modified']}")
+        print(f"       upstream request id    : {lb['upstream_request_id']}")
+        passed += 1
+
+    # Requests without a session header still get separate lanes when their
+    # structure differs, and the store stays bounded under sustained load.
+    from proxy import MAX_RECOVERY_CHECKPOINTS
+
+    for i in range(MAX_RECOVERY_CHECKPOINTS + 12):
+        # Distinct tool_definition_count -> distinct structural lane.
+        httpx.post(f"{PROXY}/v1/messages", headers=H,
+                   json={"model": "scenario:nonstream_valid", "max_tokens": 16,
+                         "messages": [{"role": "user", "content": "hi"}],
+                         "tools": [{"name": f"t{j}", "description": "d",
+                                    "input_schema": {"type": "object"}}
+                                   for j in range(i + 1)]}, timeout=60)
+    rec = recovery()
+    held = rec.get("checkpoints_held", -1)
+    if held > MAX_RECOVERY_CHECKPOINTS or held <= 0:
+        print(f"[FAIL] checkpoint store is bounded")
+        print(f"       - holding {held}, limit {MAX_RECOVERY_CHECKPOINTS}")
+        failed += 1
+    else:
+        print("[PASS] checkpoint store is bounded (oldest lanes evicted first)")
+        print(f"       lanes created          : {MAX_RECOVERY_CHECKPOINTS + 12} distinct")
+        print(f"       checkpoints held       : {held} / {MAX_RECOVERY_CHECKPOINTS}")
+        passed += 1
+
+    # --- recovery state must never carry content -----------------------------
+    # Same canary technique as the request-shape probe: send a request stuffed
+    # with sensitive values, then serialize the ENTIRE recovery state and assert
+    # not one of them survives anywhere in it.
+    print()
+    CB_SECRETS = ["CONTENT_BLOCKED_CANARY_SYSTEM", "payroll spreadsheet question",
+                  "sk-ant-not-a-real-key-2", "delete_everything",
+                  "C:/private/contracts.docx", "secret chain of thought",
+                  "tool result canary payload", "https://internal.example/secret"]
+    canary_req = {
+        "model": "scenario:http_400_content_blocked", "max_tokens": 16,
+        "system": "CONTENT_BLOCKED_CANARY_SYSTEM",
+        "messages": [{"role": "user", "content": [
+            {"type": "text",
+             "text": "payroll spreadsheet question C:/private/contracts.docx "
+                     "https://internal.example/secret"},
+            {"type": "tool_result", "tool_use_id": "toolu_canary",
+             "content": "tool result canary payload"}]}],
+        "tools": [{"name": "delete_everything", "description": "sk-ant-not-a-real-key-2",
+                   "input_schema": {"type": "object"}}],
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "output_config": {"effort": "high"},
+        "metadata": {"api_key": "sk-ant-not-a-real-key-2",
+                     "note": "secret chain of thought"},
+    }
+    httpx.post(f"{PROXY}/v1/messages", headers=H, json=canary_req, timeout=60)
+    rec_raw = httpx.get(f"{PROXY}/_recovery", timeout=10).text
+    stats_raw = httpx.get(f"{PROXY}/_stats", timeout=10).text
+    rec_json = json.loads(rec_raw)
+
+    errs = []
+    for blob, where in ((rec_raw, "/_recovery"), (stats_raw, "/_stats")):
+        leaked = [s for s in CB_SECRETS if s in blob]
+        if leaked:
+            errs.append(f"{where} leaked: {leaked}")
+    # Field names that would imply content storage.
+    for banned in ('"content"', '"system"', '"prompt"', '"text":', '"tools"',
+                   '"tool_use_id"', '"authorization"', '"api_key"', 'toolu_canary'):
+        if banned in rec_raw:
+            errs.append(f"/_recovery exposes {banned}")
+    # It must still be USEFUL: structure has to be there.
+    lb = rec_json.get("last_blocked") or {}
+    for required in ("blocked_message_count", "structural_change", "proxy_retry"):
+        if required not in lb:
+            errs.append(f"/_recovery lost required field {required}")
+    if not rec_json.get("suggested_action"):
+        errs.append("/_recovery has no suggested_action")
+    # Byte counts are aggregates, never the bytes themselves.
+    if lb.get("text_bytes") in (None, 0):
+        errs.append("text_bytes missing -- aggregate sizes should still be recorded")
+
+    if errs:
+        print("[FAIL] recovery state is structure-only")
+        for e in errs:
+            print(f"       - {e}")
+        failed += 1
+    else:
+        print("[PASS] recovery state is structure-only")
+        print(f"       canaries leaked        : none of {len(CB_SECRETS)} "
+              f"(checked /_recovery and /_stats)")
+        print(f"       content field names    : absent")
+        print(f"       still diagnostic       : {lb['blocked_message_count']} messages, "
+              f"{lb['text_bytes']} text bytes (aggregate only)")
+        passed += 1
+
+    # Model output that merely TALKS about content-blocked must never be
+    # classified. The detector only ever sees an upstream error status, so an
+    # HTTP 200 carrying those words cannot reach it -- this pins that.
+    before = stats()
+    r = httpx.post(f"{PROXY}/v1/messages", headers=H,
+                   json={"model": "scenario:nonstream_says_content_blocked",
+                         "max_tokens": 32,
+                         "messages": [{"role": "user", "content": "hi"}]}, timeout=60)
+    after = stats()
+    d_cb = after.get("upstream_400_content_blocked", 0) - before.get(
+        "upstream_400_content_blocked", 0)
+    d_ev = after.get("content_blocked_events", 0) - before.get("content_blocked_events", 0)
+    errs = []
+    if r.status_code != 200:
+        errs.append(f"status {r.status_code} != 200")
+    if "content-blocked" not in r.text:
+        errs.append("the model's own wording was not delivered to the client")
+    if d_cb or d_ev:
+        errs.append(f"assistant text classified as moderation: "
+                    f"+{d_cb} blocked, +{d_ev} events")
+    if errs:
+        print("[FAIL] model text containing 'content-blocked' is not a moderation event")
+        for e in errs:
+            print(f"       - {e}")
+        failed += 1
+    else:
+        print("[PASS] model text containing 'content-blocked' is not a moderation event")
+        print(f"       status                 : {r.status_code}, text delivered verbatim")
+        print(f"       classifier fired       : +{d_cb} (only an error status can trigger it)")
+        passed += 1
+
+    # The helper may only name Claude Code behavior that actually exists. This
+    # asserts the suggested action sticks to documented flags, and never claims
+    # to reopen a specific turn -- no CLI flag does that.
+    from proxy import suggested_action
+
+    with_session = suggested_action({"session_id": "abc-123", "message_count": 9,
+                                     "timestamp": "2026-08-08T00:00:00Z"})
+    without = suggested_action({"session_id": None, "message_count": 9,
+                                "timestamp": "2026-08-08T00:00:00Z"})
+    none_at_all = suggested_action(None)
+    helper = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "recover-content-blocked.ps1"),
+        encoding="utf-8").read()
+
+    errs = []
+    if "--resume abc-123" not in with_session:
+        errs.append("a known session id is not offered to --resume")
+    if "--fork-session" not in with_session:
+        errs.append("--fork-session is not offered")
+    if "--continue" not in without:
+        errs.append("--continue is not offered when no session id is known")
+    if "--resume" not in none_at_all:
+        errs.append("the session picker is not offered when nothing is known")
+    # Invented flags. --rewind does not exist; /rewind is an in-session command.
+    for invented in ("--rewind", "--restore", "--undo", "--replay", "--rollback",
+                     "--resume-at", "--from-message", "--truncate"):
+        for blob, where in ((with_session, "suggested_action"), (without, "suggested_action"),
+                            (helper, "recover-content-blocked.ps1")):
+            if invented in blob:
+                errs.append(f"{where} names unsupported flag {invented}")
+    # The helper must not touch conversation storage.
+    for forbidden in ("Remove-Item", "Set-Content", "Out-File", ".jsonl", "history.db",
+                      "__store.db"):
+        if forbidden in helper:
+            errs.append(f"helper writes or reads conversation storage: {forbidden}")
+    if errs:
+        print("[FAIL] recovery guidance uses only supported Claude Code behavior")
+        for e in errs:
+            print(f"       - {e}")
+        failed += 1
+    else:
+        print("[PASS] recovery guidance uses only supported Claude Code behavior")
+        print(f"       with a session id      : --resume <id>, --fork-session")
+        print(f"       without one            : --continue / --resume picker")
+        print(f"       invented flags         : none; helper never writes session files")
+        passed += 1
+
     print(f"\n{'=' * 64}\nscenario results: {passed} passed, {failed} failed")
     print("proxy counters:", json.dumps(
         {k: v for k, v in stats().items() if isinstance(v, int)}, indent=2))

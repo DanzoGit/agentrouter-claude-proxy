@@ -40,9 +40,12 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import hashlib
 import json
 import os
+import secrets
 import time
+from collections import OrderedDict
 from email.utils import parsedate_tz
 from typing import Any, AsyncIterator, Iterable, Optional
 
@@ -110,6 +113,34 @@ JUNK_TYPE_MARKERS = ("billing", "usage_summary", "credit", "quota", "balance")
 # content -- so a reply that merely discusses saturation cannot be mistaken for
 # one. Recognition is diagnostic: the status, the body and the retry decision
 # are identical whether or not a 429 matches.
+# Bounded number of last-known-good structural checkpoints kept in memory.
+# Small on purpose: recovery only ever needs the most recent accepted turn per
+# conversation, and an unbounded store would grow for the life of the process.
+MAX_RECOVERY_CHECKPOINTS = int(
+    os.environ.get("PROXY_MAX_RECOVERY_CHECKPOINTS", "32"))
+
+# Explicit moderation wording only, matched against the upstream error envelope
+# and never against assistant output. Deliberately excludes anything that could
+# also describe capacity, rate limiting, schema validation, authentication or
+# model access -- those are different failures with different handling.
+CONTENT_BLOCKED_MARKERS = (
+    "content-blocked",
+    "content_blocked",
+    "content blocked",
+    "blocked by content policy",
+    "content policy violation",
+    "content_filter",
+    "content_policy",
+    "flagged by moderation",
+)
+
+# Headers a client could use to name a conversation. Claude Code is not known to
+# send any of them; the list exists so that if one ever appears the recovery
+# lane becomes a real session id instead of a structural hash. Only the opaque
+# value is used, and it is never treated as content.
+SESSION_HEADER_CANDIDATES = ("x-session-id", "x-claude-session-id",
+                             "anthropic-session-id", "x-conversation-id")
+
 SATURATION_MARKERS = (
     "all providers are saturated",
     "providers are saturated",
@@ -190,6 +221,15 @@ STATS: dict[str, int] = {
     # can be counted without changing the shape of /_stats.
     "rate_limit_converted": 0,
     "effort_thinking_validation_errors": 0,
+    # Content-blocked recovery. upstream_400_content_blocked counts upstream
+    # responses; content_blocked_events counts recovery snapshots recorded.
+    # A 400 is never retried, so in practice they move together.
+    "upstream_400_content_blocked": 0,
+    "content_blocked_events": 0,
+    "content_blocked_sessions": 0,
+    "recovery_checkpoints_saved": 0,
+    "recovery_checkpoint_hits": 0,
+    "recovery_checkpoint_misses": 0,
 }
 
 _STARTED_AT = time.time()
@@ -994,6 +1034,11 @@ def classify_client_error(status: int, body: bytes) -> None:
             log("upstream rejected output_config.effort because thinking is not "
                 "enabled (claude_effort_requires_thinking) -- permanent schema "
                 "error, forwarded unchanged and never retried")
+        elif is_content_blocked(status, body):
+            bump("upstream_400_content_blocked")
+            log("upstream rejected the request as content-blocked (HTTP 400) -- "
+                "a real moderation decision, forwarded verbatim and never "
+                "retried; the proxy records only structural recovery metadata")
     elif status == 401:
         bump("upstream_401")
     elif status == 403:
@@ -1050,6 +1095,420 @@ def describe_request_shape(body: bytes) -> str:
         if isinstance(effort, str):
             parts.append(f"output_config.effort={effort}")
     return " ".join(parts)
+
+
+def is_content_blocked(status: int, body: bytes) -> bool:
+    """
+    Whether a 400 is AgentRouter's moderation rejection.
+
+    Only ever consulted for HTTP 400, and it reads the upstream *error
+    envelope*, never assistant output -- which arrives under HTTP 200 and so
+    cannot reach this function at all. A reply discussing the phrase
+    "content-blocked" is therefore never classified as one.
+
+    The non-JSON branch exists because the observed rejection reaches the client
+    as `API Error: 400 content-blocked`, i.e. a bare token rather than a JSON
+    envelope. It is deliberately strict: the entire body, minus punctuation and
+    whitespace, must itself be the marker. A body that merely *contains* the
+    phrase somewhere is not matched.
+    """
+    if status != 400:
+        return False
+
+    text = upstream_error_text(body)
+    if text:
+        return any(marker in text for marker in CONTENT_BLOCKED_MARKERS)
+
+    # No parseable error envelope: fall back to an exact whole-body token.
+    try:
+        raw = (body or b"").decode("utf-8", errors="replace").strip()
+    except Exception:
+        return False
+    if len(raw) > 64:
+        return False
+    normalized = raw.strip("\"' \t\r\n.").lower()
+    return normalized in CONTENT_BLOCKED_MARKERS
+
+
+# ----------------------------------------------------------------------------
+# Content-blocked recovery: bounded, structural, content-free
+# ----------------------------------------------------------------------------
+
+# Per-process salt. Fingerprints are used to group a conversation's turns and to
+# show that structure changed between the last accepted turn and the rejected
+# one. Salting them means the digests are meaningless outside this process and
+# cannot be compared against precomputed hashes of known text.
+_LANE_SALT = secrets.token_bytes(16)
+
+# lane -> last known good checkpoint. OrderedDict gives FIFO eviction.
+_CHECKPOINTS: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_LAST_BLOCKED: Optional[dict[str, Any]] = None
+_BLOCKED_LANES: set[str] = set()
+
+
+def _digest(*parts: str) -> str:
+    h = hashlib.sha256(_LANE_SALT)
+    for part in parts:
+        h.update(part.encode("utf-8", errors="replace"))
+        h.update(b"\x1f")
+    return h.hexdigest()[:16]
+
+
+def _iso(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def session_id_from_headers(headers: dict[str, str]) -> Optional[str]:
+    """
+    A client-supplied conversation id, if one exists.
+
+    Claude Code is not known to send one. When absent the caller falls back to a
+    structural lane, so recovery still works -- it just cannot name the session.
+    """
+    for key, value in (headers or {}).items():
+        if key.lower() in SESSION_HEADER_CANDIDATES:
+            candidate = (value or "").strip()
+            if candidate and len(candidate) <= 128:
+                return candidate
+    return None
+
+
+def request_structure(body: bytes) -> dict[str, Any]:
+    """
+    Safe structural metadata for one request.
+
+    Every value below is a count, a byte total, a boolean, a small enum, or a
+    salted digest. No prompt text, system text, thinking text, tool name, tool
+    argument, tool result, filename, command or URL is read, and the raw body is
+    never retained -- the returned dict is the only thing that outlives the call.
+    """
+    out: dict[str, Any] = {
+        "parsed": False, "model": None, "stream": False, "message_count": 0,
+        "role_sequence": [], "block_type_sequence": [], "text_bytes": 0,
+        "tool_result_bytes": 0, "tool_use_count": 0, "tool_result_count": 0,
+        "tool_result_error_count": 0, "thinking_present": False,
+        "thinking_type": None, "output_config_present": False,
+        "output_config_effort": None, "system_present": False,
+        "system_bytes": 0, "tool_definition_count": 0,
+    }
+    try:
+        data = json.loads((body or b"").decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return out
+    if not isinstance(data, dict):
+        return out
+    out["parsed"] = True
+
+    model = data.get("model")
+    out["model"] = model if isinstance(model, str) else None
+    out["stream"] = data.get("stream") is True
+
+    system = data.get("system")
+    out["system_present"] = "system" in data
+    if isinstance(system, str):
+        out["system_bytes"] = len(system.encode("utf-8", errors="replace"))
+    elif isinstance(system, list):
+        out["system_bytes"] = sum(
+            len(str(b.get("text", "")).encode("utf-8", errors="replace"))
+            for b in system if isinstance(b, dict))
+
+    tools = data.get("tools")
+    if isinstance(tools, list):
+        out["tool_definition_count"] = len(tools)
+
+    thinking = data.get("thinking")
+    out["thinking_present"] = "thinking" in data
+    if isinstance(thinking, dict):
+        t_type = thinking.get("type")
+        out["thinking_type"] = t_type if isinstance(t_type, str) else None
+
+    output_config = data.get("output_config")
+    out["output_config_present"] = "output_config" in data
+    if isinstance(output_config, dict):
+        effort = output_config.get("effort")
+        out["output_config_effort"] = effort if isinstance(effort, str) else None
+
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return out
+    out["message_count"] = len(messages)
+
+    roles: list[str] = []
+    block_types: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            roles.append("?")
+            continue
+        role = msg.get("role")
+        roles.append(role if isinstance(role, str) else "?")
+
+        content = msg.get("content")
+        if isinstance(content, str):
+            block_types.append("text")
+            out["text_bytes"] += len(content.encode("utf-8", errors="replace"))
+            continue
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            block_types.append(btype if isinstance(btype, str) else "?")
+            if btype == "text":
+                out["text_bytes"] += len(
+                    str(block.get("text", "")).encode("utf-8", errors="replace"))
+            elif btype == "thinking":
+                out["text_bytes"] += len(
+                    str(block.get("thinking", "")).encode("utf-8", errors="replace"))
+            elif btype == "tool_use":
+                out["tool_use_count"] += 1
+            elif btype == "tool_result":
+                out["tool_result_count"] += 1
+                if block.get("is_error") is True:
+                    out["tool_result_error_count"] += 1
+                payload = block.get("content")
+                if isinstance(payload, str):
+                    out["tool_result_bytes"] += len(
+                        payload.encode("utf-8", errors="replace"))
+                elif isinstance(payload, list):
+                    out["tool_result_bytes"] += sum(
+                        len(str(p.get("text", "")).encode("utf-8", errors="replace"))
+                        for p in payload if isinstance(p, dict))
+
+    out["role_sequence"] = roles[-24:]
+    out["block_type_sequence"] = block_types[-40:]
+    return out
+
+
+def lane_key(structure: dict[str, Any], session: Optional[str]) -> str:
+    """
+    The bucket a turn belongs to.
+
+    A real session id is used when the client supplies one. Otherwise the lane
+    is a salted digest of the conversation's opening shape -- model plus the
+    role/size profile of its first turns -- which stays stable as the
+    conversation grows and differs between concurrent conversations. It is
+    derived from counts and lengths, never from text.
+    """
+    if session:
+        return f"session:{session}"
+    roles = structure.get("role_sequence") or []
+    return "shape:" + _digest(
+        str(structure.get("model")),
+        ",".join(roles[:2]),
+        str(structure.get("system_bytes", 0)),
+        str(structure.get("tool_definition_count", 0)),
+    )
+
+
+def structural_fingerprint(structure: dict[str, Any]) -> str:
+    """A digest of the whole current shape, for showing that it changed."""
+    return _digest(
+        str(structure.get("model")),
+        ",".join(structure.get("role_sequence") or []),
+        ",".join(structure.get("block_type_sequence") or []),
+        str(structure.get("message_count", 0)),
+        str(structure.get("text_bytes", 0)),
+        str(structure.get("tool_result_bytes", 0)),
+    )
+
+
+def checkpoint_view(structure: dict[str, Any], session: Optional[str],
+                    lane: str, request_id: str, ts: float,
+                    message_stop: Optional[bool]) -> dict[str, Any]:
+    """The safe record stored and served. Counts, sizes, enums and digests."""
+    return {
+        "timestamp": _iso(ts),
+        "proxy_request_id": request_id,
+        "session_id": session,
+        "session_id_source": "client_header" if session else None,
+        "lane": lane,
+        "lane_kind": "session" if session else "structural",
+        "model": structure.get("model"),
+        "stream": structure.get("stream"),
+        "message_count": structure.get("message_count"),
+        "role_sequence": structure.get("role_sequence"),
+        "block_type_sequence": structure.get("block_type_sequence"),
+        "text_bytes": structure.get("text_bytes"),
+        "tool_result_bytes": structure.get("tool_result_bytes"),
+        "system_bytes": structure.get("system_bytes"),
+        "tool_use_count": structure.get("tool_use_count"),
+        "tool_result_count": structure.get("tool_result_count"),
+        "tool_result_error_count": structure.get("tool_result_error_count"),
+        "tool_definition_count": structure.get("tool_definition_count"),
+        "thinking_present": structure.get("thinking_present"),
+        "thinking_type": structure.get("thinking_type"),
+        "output_config_present": structure.get("output_config_present"),
+        "output_config_effort": structure.get("output_config_effort"),
+        "structural_fingerprint": structural_fingerprint(structure),
+        "message_stop_observed": message_stop,
+        "success": True,
+    }
+
+
+def save_checkpoint(pending: Optional[dict[str, Any]],
+                    message_stop: Optional[bool]) -> None:
+    """
+    Record a turn the upstream accepted as this lane's last known good state.
+
+    Called only after success. Bounded by MAX_RECOVERY_CHECKPOINTS with FIFO
+    eviction, so a long-lived proxy cannot grow without limit.
+    """
+    if not pending:
+        return
+    structure = pending.get("structure") or {}
+    if not structure.get("parsed"):
+        return
+    lane = pending["lane"]
+    _CHECKPOINTS[lane] = checkpoint_view(
+        structure, pending.get("session"), lane, pending["request_id"],
+        pending["ts"], message_stop)
+    _CHECKPOINTS.move_to_end(lane)
+    while len(_CHECKPOINTS) > MAX_RECOVERY_CHECKPOINTS:
+        _CHECKPOINTS.popitem(last=False)
+    bump("recovery_checkpoints_saved")
+
+
+def record_content_blocked(pending: Optional[dict[str, Any]],
+                           upstream_request_id: Optional[str]) -> None:
+    """
+    Snapshot a moderation rejection next to the lane's last accepted turn.
+
+    Diagnostic only. The 400, its body and the decision not to retry are
+    unaffected by anything here.
+    """
+    global _LAST_BLOCKED
+    bump("content_blocked_events")
+    if not pending:
+        return
+
+    structure = pending.get("structure") or {}
+    lane = pending["lane"]
+    last_good = _CHECKPOINTS.get(lane)
+    if last_good is None:
+        bump("recovery_checkpoint_misses")
+    else:
+        bump("recovery_checkpoint_hits")
+    if lane not in _BLOCKED_LANES:
+        _BLOCKED_LANES.add(lane)
+        bump("content_blocked_sessions")
+
+    current_fp = structural_fingerprint(structure)
+    _LAST_BLOCKED = {
+        "timestamp": _iso(pending["ts"]),
+        "proxy_request_id": pending["request_id"],
+        "upstream_request_id": upstream_request_id,
+        "session_id": pending.get("session"),
+        "lane": lane,
+        "lane_kind": "session" if pending.get("session") else "structural",
+        "model": structure.get("model"),
+        "blocked_message_count": structure.get("message_count"),
+        "last_good_message_count": (last_good or {}).get("message_count"),
+        "blocked_fingerprint": current_fp,
+        "last_good_fingerprint": (last_good or {}).get("structural_fingerprint"),
+        "structural_change": bool(
+            last_good and last_good.get("structural_fingerprint") != current_fp),
+        "role_sequence": structure.get("role_sequence"),
+        "last_good_role_sequence": (last_good or {}).get("role_sequence"),
+        "block_type_sequence": structure.get("block_type_sequence"),
+        "last_good_block_type_sequence": (last_good or {}).get("block_type_sequence"),
+        "text_bytes": structure.get("text_bytes"),
+        "last_good_text_bytes": (last_good or {}).get("text_bytes"),
+        "tool_result_bytes": structure.get("tool_result_bytes"),
+        "last_good_tool_result_bytes": (last_good or {}).get("tool_result_bytes"),
+        "tool_use_count": structure.get("tool_use_count"),
+        "last_good_tool_use_count": (last_good or {}).get("tool_use_count"),
+        "tool_result_count": structure.get("tool_result_count"),
+        "last_good_tool_result_count": (last_good or {}).get("tool_result_count"),
+        "tool_result_error_count": structure.get("tool_result_error_count"),
+        "thinking_present": structure.get("thinking_present"),
+        "thinking_type": structure.get("thinking_type"),
+        "output_config_present": structure.get("output_config_present"),
+        "output_config_effort": structure.get("output_config_effort"),
+        "have_last_good_checkpoint": last_good is not None,
+        "proxy_retry": False,
+        "request_modified": False,
+    }
+
+    log("[CONTENT_BLOCKED] "
+        f"request_id={pending['request_id']} "
+        f"upstream_request_id={upstream_request_id or '<none>'} "
+        f"session={pending.get('session') or '<none:structural-lane>'} "
+        f"lane={lane} "
+        f"last_good_messages={(last_good or {}).get('message_count', '<none>')} "
+        f"blocked_messages={structure.get('message_count')} "
+        f"structural_change={'yes' if _LAST_BLOCKED['structural_change'] else 'no'} "
+        f"proxy_retry=no request_modified=no")
+
+
+def suggested_action(last_good: Optional[dict[str, Any]]) -> str:
+    """
+    The supported Claude Code action to recover with.
+
+    Only flags this CLI actually documents are named: -c/--continue,
+    -r/--resume, --fork-session. The proxy cannot select a turn for the user --
+    Claude Code exposes no flag to resume at a specific message -- so it does
+    not pretend to.
+    """
+    if last_good is None:
+        return ("No accepted turn was recorded for this conversation. Start a new "
+                "Claude Code session, or run `claude --resume` to pick an earlier "
+                "session from the interactive picker.")
+    session = last_good.get("session_id")
+    where = (f"The last turn AgentRouter accepted had "
+             f"{last_good.get('message_count')} messages at "
+             f"{last_good.get('timestamp')}.")
+    if session:
+        return (f"{where} Resume it with `claude --resume {session}`, or "
+                f"`claude --resume {session} --fork-session` to branch instead of "
+                f"continuing in place. In the session, rewind with /rewind and "
+                f"resend without the rejected content.")
+    return (f"{where} Claude Code does not expose its session id to the proxy, so "
+            f"the proxy cannot name it. Recover with `claude --continue` for the "
+            f"most recent conversation in this directory, or `claude --resume` to "
+            f"choose from the picker; then use /rewind to step back to before the "
+            f"rejected message and resend it differently. The proxy neither "
+            f"retried nor altered the blocked request.")
+
+
+def upstream_request_id(headers: dict[str, str]) -> Optional[str]:
+    """
+    The upstream's own trace id for a rejected request, if it sent one.
+
+    Opaque identifier only -- useful when asking AgentRouter about a specific
+    rejection, and carries no conversation content.
+    """
+    for name in ("request-id", "x-request-id", "cf-ray", "x-trace-id"):
+        for key, value in (headers or {}).items():
+            if key.lower() == name and value:
+                return value[:128]
+    return None
+
+
+def recovery_state() -> dict[str, Any]:
+    """Payload for /_recovery. Safe metadata only -- see checkpoint_view."""
+    last_good = next(reversed(_CHECKPOINTS.values()), None) if _CHECKPOINTS else None
+    if _LAST_BLOCKED is not None:
+        lane_good = _CHECKPOINTS.get(_LAST_BLOCKED.get("lane", ""))
+        if lane_good is not None:
+            last_good = lane_good
+        status = "content_blocked"
+    elif last_good is not None:
+        status = "ready"
+    else:
+        status = "no_checkpoint"
+    return {
+        "status": status,
+        "last_good": last_good,
+        "last_blocked": _LAST_BLOCKED,
+        "suggested_action": suggested_action(last_good),
+        "checkpoints_held": len(_CHECKPOINTS),
+        "max_checkpoints": MAX_RECOVERY_CHECKPOINTS,
+        "session_id_available": bool(last_good and last_good.get("session_id")),
+        "notice": ("Structural metadata only. This endpoint never stores or "
+                   "returns prompts, system text, thinking text, tool names, "
+                   "tool arguments, tool results, filenames or raw bodies."),
+    }
 
 
 def classify_503(body: bytes) -> str:
@@ -1137,7 +1596,8 @@ class StreamTracker:
         return self.saw_message_stop or self.saw_error_event
 
 
-async def forward_stream(result: AttemptResult) -> AsyncIterator[bytes]:
+async def forward_stream(result: AttemptResult,
+                         pending: Optional[dict[str, Any]] = None) -> AsyncIterator[bytes]:
     """
     Replay the primed frames, then continue the live stream.
 
@@ -1246,6 +1706,9 @@ async def forward_stream(result: AttemptResult) -> AsyncIterator[bytes]:
         )
     else:
         bump("successful_requests")
+        # A stream is only known good once it has completed, so the checkpoint
+        # is written here rather than when the response headers arrived.
+        save_checkpoint(pending, True)
         log(f"stream complete: {tracker.forwarded} frames in {elapsed:.1f}s, "
             f"message_stop=yes")
 
@@ -1263,16 +1726,30 @@ def passthrough_headers(headers: dict[str, str]) -> dict[str, str]:
 
 @app.get("/_stats")
 async def stats() -> JSONResponse:
-    return JSONResponse(
-        {
-            **STATS,
-            "uptime_seconds": round(time.time() - _STARTED_AT, 1),
-            "upstream": UPSTREAM,
-            "max_attempts": MAX_ATTEMPTS,
-            "backoff_base_ms": BACKOFF_BASE_MS,
-            "prime_timeout_s": PRIME_TIMEOUT_S,
-        }
-    )
+    payload: dict[str, Any] = {
+        **STATS,
+        "uptime_seconds": round(time.time() - _STARTED_AT, 1),
+        "upstream": UPSTREAM,
+        "max_attempts": MAX_ATTEMPTS,
+        "backoff_base_ms": BACKOFF_BASE_MS,
+        "prime_timeout_s": PRIME_TIMEOUT_S,
+    }
+    # STATS holds counters only; the timestamp is merged in here so bump() stays
+    # integer-typed. Structural metadata, never content.
+    if _LAST_BLOCKED is not None:
+        payload["last_content_blocked_at"] = _LAST_BLOCKED.get("timestamp")
+    return JSONResponse(payload)
+
+
+@app.get("/_recovery")
+async def recovery() -> JSONResponse:
+    """
+    Where the last accepted turn was, and what supported action recovers it.
+
+    Safe metadata only -- counts, byte totals, enums and salted digests. No
+    prompts, no tool data, no credentials, no raw bodies.
+    """
+    return JSONResponse(recovery_state())
 
 
 @app.get("/_health")
@@ -1287,7 +1764,8 @@ async def root() -> JSONResponse:
         {
             "status": "running",
             "upstream": UPSTREAM,
-            "endpoints": ["/v1/messages", "/v1/messages?beta=true", "/_stats", "/_health"],
+            "endpoints": ["/v1/messages", "/v1/messages?beta=true", "/_stats",
+                          "/_health", "/_recovery"],
         }
     )
 
@@ -1318,6 +1796,21 @@ async def proxy(request: Request, path: str) -> Response:
     if VERBOSE:
         vlog(f"upstream headers: {redact_headers(headers)}")
 
+    # Structural recovery context for this turn. Built from counts, lengths and
+    # enums only (see request_structure); no prompt, tool or thinking text is
+    # read out of the body. Stored only if the upstream accepts the request.
+    pending: Optional[dict[str, Any]] = None
+    if is_messages:
+        structure = request_structure(body)
+        session = session_id_from_headers(dict(request.headers))
+        pending = {
+            "structure": structure,
+            "session": session,
+            "lane": lane_key(structure, session),
+            "request_id": _digest(str(time.time_ns()), str(id(request))),
+            "ts": time.time(),
+        }
+
     if not any(k.lower() == "authorization" for k in headers):
         log("no credential available (client sent none and no ANTHROPIC_AUTH_TOKEN / "
             "AGENTROUTER_API_KEY in environment)")
@@ -1330,6 +1823,12 @@ async def proxy(request: Request, path: str) -> Response:
         stream_expected=stream_requested,
         is_messages=is_messages,
     )
+
+    # A moderation rejection is recorded once, before any response branch, so
+    # that every path out of here is covered. This only writes diagnostics --
+    # the status, the body and the no-retry decision are untouched.
+    if is_messages and is_content_blocked(result.status, result.body or b""):
+        record_content_blocked(pending, upstream_request_id(result.headers))
 
     # ---- Failure after all attempts: report honestly ------------------------
     if not result.ok:
@@ -1384,7 +1883,7 @@ async def proxy(request: Request, path: str) -> Response:
         out_headers = passthrough_headers(result.headers)
         out_headers["cache-control"] = "no-cache"
         return StreamingResponse(
-            forward_stream(result),
+            forward_stream(result, pending),
             status_code=result.status,
             headers=out_headers,
             media_type="text/event-stream",
@@ -1394,6 +1893,9 @@ async def proxy(request: Request, path: str) -> Response:
     normalize_content_type = False
     if result.status == 200:
         bump("successful_requests")
+        # Upstream accepted this exact structure: it becomes the lane's last
+        # known good state to recover to if a later turn is blocked.
+        save_checkpoint(pending, None)
         log(f"non-stream response OK ({len(result.body or b'')} bytes)")
         if is_messages:
             # Diagnostic only: headers and shape, never body content. Records
