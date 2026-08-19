@@ -767,6 +767,7 @@ async def reliable_stream_body(response: httpx.Response, client: httpx.AsyncClie
     accepted: list[bytes] = []
     seen: list[str] = []
     saw_message_stop = False
+    saw_content = False
     total = 0
     deadline = time.monotonic() + READ_TIMEOUT_S
 
@@ -812,6 +813,8 @@ async def reliable_stream_body(response: httpx.Response, client: httpx.AsyncClie
                 accepted.append(raw_frame + b"\n\n")
                 if etype == "message_stop":
                     saw_message_stop = True
+                elif etype in COMMIT_EVENTS:
+                    saw_content = True
 
         if carry.strip():
             # Preserve the existing EOF-tail behavior, while retaining the
@@ -827,8 +830,10 @@ async def reliable_stream_body(response: httpx.Response, client: httpx.AsyncClie
                 accepted.append(candidate.encode("utf-8") + b"\n\n")
                 if etype == "message_stop":
                     saw_message_stop = True
+                elif etype in COMMIT_EVENTS:
+                    saw_content = True
 
-        if not saw_message_stop:
+        if not saw_message_stop or not saw_content:
             return invalid("reliable_stream_incomplete_eof", "reliable_stream_incomplete_eof")
         body = b"".join(accepted)
         bump("reliable_stream_completed")
