@@ -19,6 +19,21 @@ ATTEMPTS: dict[str, int] = {}
 TOOL_ID = "toolu_01ABCDEFGHIJKLMNOPQRSTUV"
 MSG_ID = "msg_01XYZmockmessage000000"
 
+BYTE_FIXTURE = (
+    b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_bytes","type":"message","role":"assistant","model":"mock","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+    b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"block":{"type":"thinking","thinking":""}}\n\n'
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"considering"}}\n\n'
+    b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+    b'event: content_block_start\ndata: {"type":"content_block_start","index":1,"block":{"type":"text","text":""}}\n\n'
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Unicode: \\u96ea"}}\n\n'
+    b'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n'
+    b'event: content_block_start\ndata: {"type":"content_block_start","index":2,"block":{"type":"tool_use","id":"toolu_01ABCDEFGHIJKLMNOPQRSTUV","name":"fixture_tool","input":{}}}\n\n'
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\".\\"}"}}\n\n'
+    b'event: content_block_stop\ndata: {"type":"content_block_stop","index":2}\n\n'
+    b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":9}}\n\n'
+    b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+)
+
 
 def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -387,6 +402,38 @@ async def handler(request: Request, path: str):
         for f in frames[3:]:
             yield f
 
+    async def gen_remote_break():
+        frames = list(valid_frames())
+        for f in frames[:6]:
+            yield f
+        if n < 2:
+            # httpx surfaces a closed response body as a protocol/read failure.
+            raise RuntimeError("simulated RemoteProtocolError")
+        for f in frames[6:]:
+            yield f
+
+    async def gen_always_break():
+        for f in list(valid_frames())[:6]:
+            yield f
+        raise RuntimeError("simulated RemoteProtocolError")
+
+    async def gen_byte_fixture():
+        yield BYTE_FIXTURE
+
+    async def gen_large_valid():
+        frames = list(valid_frames())
+        for f in frames[:2]:
+            yield f
+        yield sse("content_block_delta", {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "L" * 2000}})
+        for f in frames[3:]:
+            yield f
+
+    async def gen_limit():
+        yield ("event: message_start\ndata: {\"type\": \"message_start\"}\n\n" +
+               "x" * 5000)
+
     async def gen_error_event():
         yield sse("error", {"type": "error",
                             "error": {"type": "overloaded_error",
@@ -441,6 +488,11 @@ async def handler(request: Request, path: str):
         "valid": gen_valid,
         "valid_tool": gen_valid_tool,
         "slow_valid": gen_slow_valid,
+        "remote_break": gen_remote_break,
+        "always_break": gen_always_break,
+        "byte_fixture": gen_byte_fixture,
+        "large_valid": gen_large_valid,
+        "limit": gen_limit,
         "error_event": gen_error_event,
         "tail_glued": gen_tail_glued,
         "tail_lone": gen_tail_lone,

@@ -118,6 +118,7 @@ try {
     $env:PROXY_PORT           = "$ProxyPort"
     # Keep the suite quick: the timeout scenarios do not need 120s to prove.
     $env:PROXY_PRIME_TIMEOUT_S = '10'
+    $env:PROXY_STREAM_MODE     = 'normal'
 
     $proxyProc = Start-Process -FilePath $python -PassThru -WindowStyle Hidden `
         -WorkingDirectory $root `
@@ -165,16 +166,39 @@ try {
     & $python (Join-Path $here 'disconnect_test.py')
     $disconnectExit = $LASTEXITCODE
 
+    # Reliable mode runs in a second isolated proxy process so the legacy suite
+    # above remains an explicit normal-mode regression check.
+    $reliablePort = $ProxyPort + 1
+    if (-not (Test-PortFree -P $reliablePort)) { throw "port $reliablePort is already in use" }
+    $env:PROXY_PORT = "$reliablePort"
+    $env:PROXY_STREAM_MODE = 'reliable'
+    $env:PROXY_RELIABLE_MAX_BYTES = '4096'
+    $reliableProc = Start-Process -FilePath $python -PassThru -WindowStyle Hidden `
+        -WorkingDirectory $root `
+        -ArgumentList @('-m', 'uvicorn', 'proxy:app', '--host', '127.0.0.1',
+                        '--port', "$reliablePort", '--log-level', 'warning', '--no-access-log')
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Milliseconds 250
+        try {
+            $h = Invoke-RestMethod "http://127.0.0.1:$reliablePort/_health" -TimeoutSec 3 -ErrorAction Stop
+            if ($h.status -eq 'ok') { break }
+        } catch { }
+    }
+    $env:TEST_RELIABLE_PROXY_URL = "http://127.0.0.1:$reliablePort"
+    Write-Host "`n[test ] reliable stream suite" -ForegroundColor Cyan
+    & $python (Join-Path $here 'reliable_tests.py')
+    $reliableExit = $LASTEXITCODE
+
     # ---- 8. counters ------------------------------------------------------
     Write-Host "`n[test ] /_stats" -ForegroundColor Cyan
     $st = Invoke-RestMethod "http://127.0.0.1:$ProxyPort/_stats" -TimeoutSec 10
     $st | ConvertTo-Json -Depth 3 | Write-Host
 
-    if ($scenarioExit -eq 0 -and $disconnectExit -eq 0) {
+    if ($scenarioExit -eq 0 -and $disconnectExit -eq 0 -and $reliableExit -eq 0) {
         Write-Host "`n[ ok  ] ALL TESTS PASSED" -ForegroundColor Green
         $exitCode = 0
     } else {
-        Write-Host "`n[fail ] scenario=$scenarioExit disconnect=$disconnectExit" -ForegroundColor Red
+        Write-Host "`n[fail ] scenario=$scenarioExit disconnect=$disconnectExit reliable=$reliableExit" -ForegroundColor Red
         $exitCode = 1
     }
 }
@@ -184,13 +208,14 @@ catch {
 }
 finally {
     # Only ever stops the two processes this script started itself.
-    foreach ($p in @($proxyProc, $mockProc)) {
+    foreach ($p in @($reliableProc, $proxyProc, $mockProc)) {
         if ($p -and -not $p.HasExited) {
             try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch { }
         }
     }
     Remove-Item Env:AGENTROUTER_UPSTREAM, Env:PROXY_PORT, Env:PROXY_PRIME_TIMEOUT_S, `
-                Env:TEST_PROXY_URL, Env:TEST_MOCK_URL -ErrorAction SilentlyContinue
+                 Env:TEST_PROXY_URL, Env:TEST_MOCK_URL, Env:TEST_RELIABLE_PROXY_URL, `
+                 Env:PROXY_STREAM_MODE, Env:PROXY_RELIABLE_MAX_BYTES -ErrorAction SilentlyContinue
 }
 
 exit $exitCode

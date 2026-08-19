@@ -76,6 +76,11 @@ PRIME_TIMEOUT_S = float(os.environ.get("PROXY_PRIME_TIMEOUT_S", "120"))
 CONNECT_TIMEOUT_S = float(os.environ.get("PROXY_CONNECT_TIMEOUT_S", "15"))
 READ_TIMEOUT_S = float(os.environ.get("PROXY_READ_TIMEOUT_S", "600"))
 
+STREAM_MODE = os.environ.get("PROXY_STREAM_MODE", "normal").strip().lower()
+if STREAM_MODE not in ("normal", "reliable"):
+    STREAM_MODE = "normal"
+RELIABLE_MAX_BYTES = int(os.environ.get("PROXY_RELIABLE_MAX_BYTES", str(16 * 1024 * 1024)))
+
 VERBOSE = os.environ.get("PROXY_VERBOSE", "0") not in ("0", "", "false", "False")
 
 # Advertised to the client when the upstream rate-limits us but sends no
@@ -230,6 +235,16 @@ STATS: dict[str, int] = {
     "recovery_checkpoints_saved": 0,
     "recovery_checkpoint_hits": 0,
     "recovery_checkpoint_misses": 0,
+    "reliable_stream_requests": 0,
+    "reliable_stream_completed": 0,
+    "reliable_stream_retry_attempts": 0,
+    "reliable_stream_recovered": 0,
+    "reliable_stream_exhausted": 0,
+    "reliable_stream_remote_protocol_errors": 0,
+    "reliable_stream_incomplete_eof": 0,
+    "reliable_stream_buffer_limit_exceeded": 0,
+    "reliable_stream_bytes_buffered": 0,
+    "reliable_stream_client_disconnects": 0,
 }
 
 _STARTED_AT = time.time()
@@ -745,6 +760,87 @@ async def prime_stream(response: httpx.Response, client: httpx.AsyncClient) -> A
     return abandon("truncated_before_content", "malformed_streams")
 
 
+async def reliable_stream_body(response: httpx.Response, client: httpx.AsyncClient) -> AttemptResult:
+    """Buffer one complete SSE attempt before allowing a client commit."""
+    stream_iter = response.aiter_bytes().__aiter__()
+    carry = b""
+    accepted: list[bytes] = []
+    seen: list[str] = []
+    saw_message_stop = False
+    total = 0
+    deadline = time.monotonic() + READ_TIMEOUT_S
+
+    def invalid(reason: str, counter: str = "malformed_streams") -> AttemptResult:
+        bump(counter)
+        return AttemptResult(ok=False, reason=reason, transient=True,
+                             status=response.status_code, response=response,
+                             client=client, headers=dict(response.headers))
+
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return invalid("reliable_stream_timeout")
+            try:
+                chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=remaining)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                return invalid("reliable_stream_timeout")
+            except (httpx.HTTPError, OSError) as exc:
+                if isinstance(exc, httpx.RemoteProtocolError):
+                    bump("reliable_stream_remote_protocol_errors")
+                return invalid(f"reliable_stream_broke:{type(exc).__name__}")
+
+            total += len(chunk)
+            bump("reliable_stream_bytes_buffered", len(chunk))
+            if total > RELIABLE_MAX_BYTES:
+                return invalid("reliable_stream_buffer_limit_exceeded", "reliable_stream_buffer_limit_exceeded")
+            carry += chunk
+            while b"\n\n" in carry:
+                raw_frame, carry = carry.split(b"\n\n", 1)
+                if not raw_frame.strip():
+                    continue
+                text = raw_frame.decode("utf-8", errors="replace")
+                etype, data, parseable = parse_frame(text)
+                seen.append(etype or "<untyped>")
+                reason = drop_reason(etype, data, parseable)
+                if reason:
+                    bump("dropped_sse_frames")
+                    log(f"dropped SSE frame: type={etype or '<none>'} reason={reason}")
+                    continue
+                accepted.append(raw_frame + b"\n\n")
+                if etype == "message_stop":
+                    saw_message_stop = True
+
+        if carry.strip():
+            # Preserve the existing EOF-tail behavior, while retaining the
+            # original bytes for each complete candidate.
+            tail_text = carry.decode("utf-8", errors="replace")
+            candidates = split_trailing_frames(tail_text)
+            for candidate in candidates:
+                etype, data, parseable = parse_frame(candidate)
+                reason = drop_reason(etype, data, parseable)
+                if reason:
+                    bump("dropped_sse_frames")
+                    continue
+                accepted.append(candidate.encode("utf-8") + b"\n\n")
+                if etype == "message_stop":
+                    saw_message_stop = True
+
+        if not saw_message_stop:
+            return invalid("reliable_stream_incomplete_eof", "reliable_stream_incomplete_eof")
+        body = b"".join(accepted)
+        bump("reliable_stream_completed")
+        return AttemptResult(ok=True, reason="reliable_stream_complete", status=200,
+                             body=body, headers=dict(response.headers), is_sse=True)
+    except asyncio.CancelledError:
+        bump("reliable_stream_client_disconnects")
+        raise
+    finally:
+        await close_quietly(response, client)
+
+
 # ----------------------------------------------------------------------------
 # Non-streaming validation
 # ----------------------------------------------------------------------------
@@ -901,6 +997,8 @@ async def attempt_upstream(
 
     # --- Streaming path -----------------------------------------------------
     if stream_expected and is_sse:
+        if STREAM_MODE == "reliable":
+            return await reliable_stream_body(response, client)
         return await prime_stream(response, client)
 
     if stream_expected and not is_sse:
@@ -1535,6 +1633,9 @@ async def run_with_retries(
 ) -> AttemptResult:
     last: Optional[AttemptResult] = None
 
+    if stream_expected and STREAM_MODE == "reliable":
+        bump("reliable_stream_requests")
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
         log(f"upstream attempt {attempt}")
         result = await attempt_upstream(
@@ -1546,6 +1647,8 @@ async def run_with_retries(
         if result.ok:
             if attempt > 1:
                 bump("retries_successful")
+                if stream_expected and STREAM_MODE == "reliable":
+                    bump("reliable_stream_recovered")
                 log(f"recovered on attempt {attempt}")
             return result
 
@@ -1558,15 +1661,41 @@ async def run_with_retries(
             return result
 
         if attempt >= MAX_ATTEMPTS:
+            if stream_expected and STREAM_MODE == "reliable":
+                bump("reliable_stream_exhausted")
             log(f"all {MAX_ATTEMPTS} attempts failed ({result.reason})")
             return result
 
         delay_ms = BACKOFF_BASE_MS * (2 ** (attempt - 1))
         bump("retries")
+        if stream_expected and STREAM_MODE == "reliable":
+            bump("reliable_stream_retry_attempts")
         log(f"retrying in {delay_ms}ms")
         await asyncio.sleep(delay_ms / 1000.0)
 
     return last or AttemptResult(ok=False, reason="no_attempt_made")
+
+
+async def run_reliable_request(request: Request, **kwargs: Any) -> Optional[AttemptResult]:
+    """Cancel a buffered upstream attempt as soon as its client disconnects."""
+    upstream = asyncio.create_task(run_with_retries(**kwargs))
+
+    async def disconnected() -> None:
+        while not await request.is_disconnected():
+            await asyncio.sleep(0.05)
+
+    watcher = asyncio.create_task(disconnected())
+    done, _ = await asyncio.wait((upstream, watcher), return_when=asyncio.FIRST_COMPLETED)
+    if upstream in done:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+        return upstream.result()
+
+    upstream.cancel()
+    await asyncio.gather(upstream, return_exceptions=True)
+    bump("reliable_stream_client_disconnects")
+    log("client disconnected while reliable stream was buffering -- upstream cancelled")
+    return None
 
 
 # ----------------------------------------------------------------------------
@@ -1733,6 +1862,8 @@ async def stats() -> JSONResponse:
         "max_attempts": MAX_ATTEMPTS,
         "backoff_base_ms": BACKOFF_BASE_MS,
         "prime_timeout_s": PRIME_TIMEOUT_S,
+        "stream_mode": STREAM_MODE,
+        "reliable_max_bytes": RELIABLE_MAX_BYTES,
     }
     # STATS holds counters only; the timestamp is merged in here so bump() stays
     # integer-typed. Structural metadata, never content.
@@ -1755,7 +1886,9 @@ async def recovery() -> JSONResponse:
 @app.get("/_health")
 async def health() -> JSONResponse:
     return JSONResponse({"status": "ok", "upstream": UPSTREAM,
-                         "listen": f"{LISTEN_HOST}:{PORT}"})
+                         "listen": f"{LISTEN_HOST}:{PORT}",
+                         "stream_mode": STREAM_MODE,
+                         "reliable_max_bytes": RELIABLE_MAX_BYTES})
 
 
 @app.get("/")
@@ -1815,14 +1948,15 @@ async def proxy(request: Request, path: str) -> Response:
         log("no credential available (client sent none and no ANTHROPIC_AUTH_TOKEN / "
             "AGENTROUTER_API_KEY in environment)")
 
-    result = await run_with_retries(
-        method=request.method,
-        url=url,
-        headers=headers,
-        body=body,
-        stream_expected=stream_requested,
-        is_messages=is_messages,
-    )
+    retry_args = {"method": request.method, "url": url, "headers": headers,
+                  "body": body, "stream_expected": stream_requested,
+                  "is_messages": is_messages}
+    if stream_requested and STREAM_MODE == "reliable":
+        result = await run_reliable_request(request, **retry_args)
+        if result is None:
+            return Response(status_code=499)
+    else:
+        result = await run_with_retries(**retry_args)
 
     # A moderation rejection is recorded once, before any response branch, so
     # that every path out of here is covered. This only writes diagnostics --
@@ -1879,6 +2013,14 @@ async def proxy(request: Request, path: str) -> Response:
         )
 
     # ---- Success: streaming -------------------------------------------------
+    if result.is_sse and result.body is not None:
+        bump("successful_requests")
+        save_checkpoint(pending, True)
+        out_headers = passthrough_headers(result.headers)
+        out_headers["cache-control"] = "no-cache"
+        return Response(content=result.body, status_code=result.status,
+                        headers=out_headers, media_type="text/event-stream")
+
     if result.is_sse and result.stream_iter is not None:
         out_headers = passthrough_headers(result.headers)
         out_headers["cache-control"] = "no-cache"
