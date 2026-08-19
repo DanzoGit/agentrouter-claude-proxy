@@ -1,6 +1,10 @@
 """Deterministic end-to-end tests for reliable buffered streaming."""
 
 import os
+import json
+import socket
+import time
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -82,6 +86,26 @@ def main() -> int:
                        and attempts(scenario) == 1))
         if scenario == "http_429_saturated_hint":
             checks.append(("Retry-After preserved", out.headers.get("retry-after") == "42"))
+
+    before = httpx.get(f"{PROXY}/_stats", timeout=10).json()
+    target = urlsplit(PROXY)
+    body = json.dumps({"model": "scenario:slow_valid", "max_tokens": 64,
+                       "stream": True,
+                       "messages": [{"role": "user", "content": "hi"}]}).encode()
+    sock = socket.create_connection((target.hostname, target.port), timeout=10)
+    sock.sendall((f"POST /v1/messages HTTP/1.1\r\nHost: {target.netloc}\r\n"
+                  f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+                  "Connection: close\r\n\r\n").encode() + body)
+    time.sleep(0.25)
+    sock.close()
+    disconnected = False
+    for _ in range(40):
+        time.sleep(0.1)
+        current = httpx.get(f"{PROXY}/_stats", timeout=10).json()
+        if current["reliable_stream_client_disconnects"] > before["reliable_stream_client_disconnects"]:
+            disconnected = True
+            break
+    checks.append(("client disconnect cancels buffering", disconnected))
 
     stats = httpx.get(f"{PROXY}/_stats", timeout=10).json()
     checks.append(("reliable counters", stats["reliable_stream_recovered"] >= 2

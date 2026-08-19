@@ -834,9 +834,6 @@ async def reliable_stream_body(response: httpx.Response, client: httpx.AsyncClie
         bump("reliable_stream_completed")
         return AttemptResult(ok=True, reason="reliable_stream_complete", status=200,
                              body=body, headers=dict(response.headers), is_sse=True)
-    except asyncio.CancelledError:
-        bump("reliable_stream_client_disconnects")
-        raise
     finally:
         await close_quietly(response, client)
 
