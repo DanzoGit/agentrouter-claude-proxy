@@ -260,6 +260,19 @@ if ($keyVar) {
 # ---------------------------------------------------------------------------
 if ($Verbose_) { $env:PROXY_VERBOSE = '1' }
 
+# The proxy's diagnostics can carry U+FFFD: an unusable upstream body is decoded
+# with errors="replace" before a short preview of it is logged. On a console
+# whose codepage is not UTF-8 -- cp1251 here -- print() then raises
+# UnicodeEncodeError from inside the request handler, which turns a reported
+# upstream failure into a 500 and a traceback on stderr. UTF-8 with replacement
+# on the child's own streams keeps a diagnostic from ever breaking a request.
+$env:PYTHONIOENCODING = 'utf-8:replace'
+
+# And decode that child's output as UTF-8 on this side, so the bytes reaching the
+# log file are the ones Python wrote. Absent a console host this is unavailable,
+# which costs nothing but fidelity on non-ASCII log lines.
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
+
 # So /_health reports the address it is genuinely bound to, which is what the
 # single-instance guard above compares against.
 $env:PROXY_PORT = "$Port"
