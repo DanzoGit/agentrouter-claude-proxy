@@ -1,0 +1,929 @@
+<!doctype html>
+<!--
+  Panel for the local relay. Served by proxy.py at /_ui.
+
+  Two rules this file lives by:
+    * Nothing is loaded from the network. No fonts, no icons, no CDN. A panel
+      that watches a transport must not depend on that transport, and the proxy
+      forwards unknown paths upstream -- so even a favicon request would leave
+      the machine. href="data:," stops the browser asking for one.
+    * It only ever reads /_health, /_stats, /_recovery and /_events. All four
+      are structural metadata; none of them carries prompt or completion text.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Local relay</title>
+<script>
+  // Runs before the first paint, so a light-theme reader never sees dark flash by.
+  // ?theme= wins over the stored choice, which lets a screenshot ask for either.
+  (function () {
+    var q = new URLSearchParams(location.search).get("theme");
+    var saved = null;
+    try { saved = localStorage.getItem("relay-theme"); } catch (e) { /* private mode */ }
+    var theme = q === "light" || q === "dark" ? q : (saved === "light" ? "light" : "dark");
+    document.documentElement.dataset.theme = theme;
+  })();
+</script>
+<style>
+  :root {
+    /* Blueprint ground, brass signal. A gauge on a bench, not a dashboard. */
+    --ink:        #0c1620;
+    --panel:      #111d29;
+    --panel-2:    #0f1a25;
+    --rule:       #22323f;
+    --grid:       rgba(126,171,209,.05);
+    --paper:      #d3e1ec;
+    --muted:      #7a8fa2;
+    --faint:      #4a5c6d;
+    --brass:      #e0a441;
+    --brass-dim:  #8a6526;
+    --verm:       #e35a3f;
+    --moss:       #62a98a;
+    --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", "SF Mono", Consolas, monospace;
+    --prose: system-ui, "Segoe UI", sans-serif;
+    color-scheme: dark;
+  }
+
+  /* Dark is the default, not a preference: this panel is read beside a terminal.
+     Light is opt-in through the header switch or ?theme=light. */
+  :root[data-theme="light"] {
+    --ink:       #e4ebf1;
+    --panel:     #f8fbfc;
+    --panel-2:   #eef4f9;
+    --rule:      #bed0de;
+    --grid:      rgba(28,78,118,.075);
+    --paper:     #11202c;
+    --muted:     #4f6678;
+    --faint:     #8496a6;
+    --brass:     #90630f;
+    --brass-dim: #cfab66;
+    --verm:      #b8331c;
+    --moss:      #2a7454;
+    color-scheme: light;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 26px 20px 56px;
+    background-color: var(--ink);
+    /* Millimetre paper: present, never legible. */
+    background-image:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 26px 26px;
+    color: var(--paper);
+    font: 13px/1.5 var(--mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .sheet { max-width: 1120px; margin: 0 auto; }
+
+  /* ---------- nameplate ------------------------------------------------ */
+
+  .plate {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 22px;
+    padding: 12px 16px;
+    border: 1px solid var(--rule);
+    background: linear-gradient(var(--panel), var(--panel-2));
+  }
+  .plate h1 {
+    margin: 0; font-size: 15px; font-weight: 600;
+    letter-spacing: .26em; text-transform: uppercase;
+  }
+  .plate .sub { color: var(--muted); letter-spacing: .04em; }
+  .plate .spacer { flex: 1 1 40px; }
+  .plate dl { display: flex; flex-wrap: wrap; gap: 10px 18px; margin: 0; }
+  .plate div.f { display: flex; flex-direction: column; gap: 2px; }
+  .plate dt {
+    font-size: 10px; letter-spacing: .18em; text-transform: uppercase;
+    color: var(--faint);
+  }
+  .plate dd { margin: 0; }
+
+  .lamp { display: inline-flex; align-items: center; gap: 8px; }
+  .lamp i {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--brass); box-shadow: 0 0 0 3px rgba(224,164,65,.14);
+    animation: breathe 2.6s ease-in-out infinite;
+  }
+  body.offline .lamp i { background: var(--verm); box-shadow: 0 0 0 3px rgba(227,90,63,.16); animation: none; }
+  body.idle .lamp i { animation: none; opacity: .55; }
+  @keyframes breathe { 50% { opacity: .35; } }
+
+  /* ---------- signature: the line -------------------------------------- */
+
+  .relay {
+    border: 1px solid var(--rule); border-top: 0;
+    background: var(--panel-2);
+    padding: 22px 16px 14px;
+  }
+
+  .hops { display: flex; align-items: center; gap: 12px; }
+  .hop { display: flex; flex-direction: column; gap: 3px; white-space: nowrap; }
+  .hop b { font-weight: 600; letter-spacing: .02em; }
+  .hop i {
+    font-style: normal; font-size: 10px; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--faint);
+  }
+  .hop.here b { color: var(--brass); border-bottom: 2px solid var(--brass-dim); padding-bottom: 1px; }
+  .hop:last-child { text-align: right; }
+
+  /* A drawn rail rather than a border: dashes read as a schematic, and the
+     brass pulse only travels while requests are actually passing. */
+  .wire { position: relative; flex: 1 1 60px; height: 9px; overflow: hidden; }
+  .wire::before {
+    content: ""; position: absolute; left: 0; right: 0; top: 4px;
+    border-top: 1px dashed var(--rule);
+  }
+  .wire::after {
+    content: ""; position: absolute; left: 0; top: 4px; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--brass), transparent);
+    width: 34%; transform: translateX(-120%); opacity: 0;
+  }
+  body.live .wire::after { opacity: 1; animation: travel 2.4s linear infinite; }
+  body.live .wire.back::after { animation-direction: reverse; animation-duration: 3.1s; }
+  @keyframes travel { to { transform: translateX(320%); } }
+
+  /* ---------- signature: the trace ------------------------------------- */
+
+  .trace {
+    position: relative; height: 132px; margin: 18px 0 0;
+    border-left: 1px solid var(--rule);
+  }
+  .trace .guide { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--rule); opacity: .55; }
+  .trace .guide span {
+    position: absolute; left: 4px; top: -14px;
+    font-size: 10px; letter-spacing: .14em; color: var(--muted);
+  }
+  .trace .base { position: absolute; left: 0; right: 0; border-top: 1px solid var(--rule); }
+  .trace .tick { position: absolute; width: 4px; border-radius: 1px; }
+  .trace .tick.up { background: var(--moss); }
+  .trace .tick.replay { background: var(--brass); }
+  .trace .tick.down { background: var(--verm); }
+  .trace .tick.hold { background: var(--brass-dim); }
+  .trace .empty {
+    position: absolute; inset: auto 0 42%; text-align: center;
+    color: var(--faint); letter-spacing: .12em; text-transform: uppercase; font-size: 10px;
+  }
+
+  .axis {
+    display: flex; justify-content: space-between;
+    margin-top: 6px; font-size: 10px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--faint);
+  }
+
+  .tallies {
+    display: flex; flex-wrap: wrap; gap: 26px;
+    margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--rule);
+  }
+  .tally { display: flex; flex-direction: column; gap: 2px; }
+  .tally b { font-size: 26px; font-weight: 500; line-height: 1; letter-spacing: -.01em; }
+  .tally span {
+    font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: var(--faint);
+  }
+  .tally.bad b { color: var(--verm); }
+  .tally.warn b { color: var(--brass); }
+  .tally.zero b { color: var(--muted); }
+  .tallies .rate { margin-left: auto; align-self: flex-end; color: var(--muted); }
+
+  /* ---------- panels ---------------------------------------------------- */
+
+  .panels {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(268px, 1fr));
+    gap: 14px; margin-top: 14px;
+  }
+  .panel { border: 1px solid var(--rule); background: var(--panel); padding: 14px 16px 16px; align-self: start; }
+  .panel > h2 {
+    display: flex; align-items: baseline; gap: 10px;
+    margin: 0 0 12px; font-size: 10px; font-weight: 600;
+    letter-spacing: .2em; text-transform: uppercase; color: var(--muted);
+  }
+  .panel > h2::after { content: ""; flex: 1; border-top: 1px solid var(--rule); }
+
+  .m { display: flex; align-items: baseline; gap: 6px; padding: 3px 0; }
+  .m .k { color: var(--muted); white-space: nowrap; }
+  .m .lead { flex: 1; border-bottom: 1px dotted var(--rule); transform: translateY(-4px); min-width: 12px; }
+  .m .v { font-variant-numeric: tabular-nums; }
+  .m.zero .k, .m.zero .v { color: var(--faint); }
+  .m.hit .v { color: var(--verm); }
+  .m.good .v { color: var(--moss); }
+  .m.note .v { color: var(--brass); }
+
+  /* ---------- recovery -------------------------------------------------- */
+
+  .wide { margin-top: 14px; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border: 1px solid var(--rule);
+    font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: var(--moss);
+  }
+  .badge.bad { color: var(--verm); border-color: var(--verm); }
+  .badge.idle { color: var(--muted); }
+
+  .slots { display: flex; gap: 3px; margin: 12px 0 6px; }
+  .slots i { width: 100%; max-width: 14px; height: 12px; background: var(--rule); }
+  .slots i.on { background: var(--brass); }
+
+  .prose {
+    font-family: var(--prose); font-size: 13px; line-height: 1.62;
+    color: var(--paper); max-width: 78ch; margin: 10px 0 0;
+  }
+  .prose code {
+    font-family: var(--mono); font-size: 12px; color: var(--brass);
+    background: var(--panel-2); padding: 1px 4px;
+  }
+  .fineprint { font-family: var(--prose); font-size: 11.5px; color: var(--faint); max-width: 82ch; margin: 12px 0 0; }
+
+  .recovery-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px 26px; }
+
+  /* ---------- feed ------------------------------------------------------ */
+
+  #feed > h2 { margin-bottom: 8px; }
+  /* order pushes the tools past the h2 rule, so the line separates the two */
+  .tools { display: flex; align-items: center; gap: 8px; margin-left: auto; order: 1; }
+
+  button {
+    font: inherit; font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--muted); background: transparent;
+    border: 1px solid var(--rule); padding: 3px 9px; cursor: pointer;
+  }
+  button:hover { color: var(--paper); border-color: var(--muted); }
+  button[aria-pressed="true"] { color: var(--brass); border-color: var(--brass-dim); }
+  button:focus-visible, a:focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; }
+
+  .skin { align-self: center; padding: 2px 8px; }
+
+  .feed {
+    height: 268px; overflow-y: auto; overscroll-behavior: contain;
+    border-top: 1px solid var(--rule); padding-top: 10px;
+    /* The top line is usually mid-scroll; fading it says "there is more above"
+       instead of looking like a clipping bug. */
+    mask-image: linear-gradient(to bottom, transparent 0, #000 14px);
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 14px);
+  }
+  .row { display: flex; gap: 10px; padding: 1px 0; align-items: baseline; }
+  .row .t { color: var(--faint); flex: none; }
+  .row .g { flex: none; width: 1em; text-align: center; color: var(--muted); }
+  .row .x { word-break: break-word; color: var(--muted); }
+  .row.request .g, .row.request .x { color: var(--paper); }
+  .row.ok .g { color: var(--moss); }
+  .row.warn .g, .row.warn .x { color: var(--brass); }
+  .row.fail .g, .row.fail .x { color: var(--verm); }
+  .feed .empty { color: var(--faint); padding: 6px 0; }
+
+  /* ---------- offline --------------------------------------------------- */
+
+  .alarm {
+    display: none; border: 1px solid var(--verm); border-top: 0;
+    background: var(--panel); padding: 12px 16px;
+  }
+  body.offline .alarm { display: block; }
+  body.offline .relay, body.offline .panels, body.offline .wide { opacity: .38; }
+  .alarm p { margin: 0; font-family: var(--prose); font-size: 13px; }
+  .alarm strong { color: var(--verm); font-family: var(--mono); letter-spacing: .1em; text-transform: uppercase; font-size: 11px; }
+
+  /* ---------- footer ---------------------------------------------------- */
+
+  footer {
+    display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: baseline;
+    margin-top: 16px; color: var(--faint); font-size: 11px;
+  }
+  footer a { color: var(--muted); text-decoration: none; border-bottom: 1px solid var(--rule); }
+  footer a:hover { color: var(--brass); border-color: var(--brass-dim); }
+  footer .keys { margin-left: auto; }
+  kbd { border: 1px solid var(--rule); padding: 0 4px; color: var(--muted); }
+
+  @media (max-width: 620px) {
+    body { padding: 14px 12px 40px; }
+    .hops { flex-wrap: wrap; }
+    .wire { flex-basis: 100%; }
+    .hop:last-child { text-align: left; }
+    .tallies { gap: 18px; }
+    .tallies .rate { margin-left: 0; }
+    /* Leaders need room the narrow layout does not have; labels wrap instead. */
+    .m { display: grid; grid-template-columns: 1fr auto; gap: 0 10px; }
+    .m .k { white-space: normal; }
+    .m .lead { display: none; }
+    .plate h1 { font-size: 13px; }
+    .feed { height: 320px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .lamp i { animation: none; }
+    body.live .wire::after { animation: none; transform: translateX(0); width: 100%; opacity: .22; }
+  }
+</style>
+</head>
+<body class="idle">
+<div class="sheet">
+
+  <header class="plate">
+    <h1>Local relay</h1>
+    <span class="sub">Anthropic messages API &middot; loopback only</span>
+    <span class="spacer"></span>
+    <dl>
+      <div class="f"><dt>State</dt><dd class="lamp"><i></i><span id="state" aria-live="polite">Connecting</span></dd></div>
+      <div class="f"><dt>Uptime</dt><dd id="uptime">&mdash;</dd></div>
+      <div class="f"><dt>Stream mode</dt><dd id="mode">&mdash;</dd></div>
+      <div class="f"><dt>Refreshed</dt><dd id="ago">&mdash;</dd></div>
+    </dl>
+    <button id="theme" class="skin" title="Switch to the light theme (t)">Light</button>
+  </header>
+
+  <div class="alarm">
+    <p><strong>No answer</strong> &nbsp; Nothing is listening on this address. Start the
+      relay again with <code>start-proxy.ps1 -Service</code>, then this page picks it back up
+      on its own. Figures below are the last ones read.</p>
+  </div>
+
+  <section class="relay" aria-label="Transport">
+    <div class="hops">
+      <span class="hop"><b>claude code</b><i>client</i></span>
+      <div class="wire"></div>
+      <span class="hop here"><b id="hopSelf">127.0.0.1</b><i>this relay</i></span>
+      <div class="wire back"></div>
+      <span class="hop"><b id="hopUp">&mdash;</b><i>upstream</i></span>
+    </div>
+
+    <div class="trace" id="trace" role="img" aria-label="Recent traffic: stream duration above the line, failures below">
+      <div class="empty" id="traceEmpty">No traffic yet in this window</div>
+    </div>
+    <div class="axis"><span id="axisLeft">5 min ago</span><span>now</span></div>
+
+    <div class="tallies" id="tallies">
+      <div class="tally"><b id="tRequests">&mdash;</b><span>requests</span></div>
+      <div class="tally"><b id="tClean">&mdash;</b><span>clean</span></div>
+      <div class="tally"><b id="tReplayed">&mdash;</b><span>recovered by replay</span></div>
+      <div class="tally"><b id="tFailed">&mdash;</b><span>failed</span></div>
+      <div class="rate" id="rate">&nbsp;</div>
+    </div>
+  </section>
+
+  <div class="panels">
+    <section class="panel"><h2>Traffic</h2><div id="gTraffic"></div></section>
+    <section class="panel"><h2>Replay</h2><div id="gReplay"></div></section>
+    <section class="panel"><h2>Upstream answers</h2><div id="gUpstream"></div></section>
+  </div>
+
+  <section class="panel wide" id="recovery">
+    <h2>Recovery</h2>
+    <div class="recovery-grid">
+      <div>
+        <span class="badge" id="recState">&mdash;</span>
+        <div class="slots" id="recSlots" role="img" aria-label="Checkpoints held"></div>
+        <div class="m"><span class="k">checkpoints held</span><span class="lead"></span><span class="v" id="recHeld">&mdash;</span></div>
+        <div id="gRecovery"></div>
+      </div>
+      <div>
+        <p class="prose" id="recAction">&mdash;</p>
+        <p class="fineprint" id="recNotice"></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel wide" id="feed">
+    <h2>Feed
+      <span class="tools">
+        <button id="fAll" aria-pressed="true">All</button>
+        <button id="fProblems" aria-pressed="false">Problems</button>
+        <button id="pause" aria-pressed="false">Pause</button>
+      </span>
+    </h2>
+    <div class="feed" id="feedBody" tabindex="0"><div class="empty">Waiting for the first line.</div></div>
+  </section>
+
+  <footer>
+    <span>Raw:</span>
+    <a href="/_health">/_health</a>
+    <a href="/_stats">/_stats</a>
+    <a href="/_recovery">/_recovery</a>
+    <a href="/_events">/_events</a>
+    <span class="keys"><kbd>p</kbd> pause &nbsp; <kbd>f</kbd> filter &nbsp; <kbd>r</kbd> refresh &nbsp; <kbd>t</kbd> theme</span>
+  </footer>
+
+</div>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Metric groups. Polarity decides the colour: "bad" means any count above zero
+// is a problem worth spotting, "good" means it is the proxy having worked.
+// ---------------------------------------------------------------------------
+
+const GROUPS = [
+  ["gTraffic", [
+    ["total_requests",       "requests",                 ""],
+    ["successful_requests",  "clean",                    "good"],
+    ["failed_requests",      "failed",                   "bad"],
+    ["empty_200_responses",  "empty 200 bodies",         "bad"],
+    ["malformed_streams",    "malformed streams",        "bad"],
+    ["dropped_sse_frames",   "junk frames dropped",      "note"],
+    ["post_commit_failures", "broke after first byte",   "bad"],
+    ["client_disconnects",   "client hung up",           ""],
+  ]],
+  ["gReplay", [
+    ["reliable_stream_requests",                "streams buffered",        ""],
+    ["reliable_stream_completed",               "delivered whole",         "good"],
+    ["retries",                                 "retries",                 "note"],
+    ["retries_successful",                      "retries that worked",     "good"],
+    ["reliable_stream_retry_attempts",          "replays started",         "note"],
+    ["reliable_stream_recovered",               "recovered by replay",     "good"],
+    ["reliable_stream_exhausted",               "gave up after replays",   "bad"],
+    ["reliable_stream_remote_protocol_errors",  "upstream cut connection", "bad"],
+    ["reliable_stream_incomplete_eof",          "truncated at eof",        "bad"],
+    ["reliable_stream_buffer_limit_exceeded",   "over buffer limit",       "bad"],
+    ["reliable_stream_client_disconnects",      "client left mid-buffer",  ""],
+    ["reliable_stream_bytes_buffered",          "buffered",                "bytes"],
+  ]],
+  ["gUpstream", [
+    ["upstream_400",                       "400 bad request",          "bad"],
+    ["upstream_401",                       "401 unauthorized",         "bad"],
+    ["upstream_403",                       "403 forbidden",            "bad"],
+    ["upstream_429",                       "429 rate limited",         "bad"],
+    ["upstream_429_saturated",             "429 saturated",            "bad"],
+    ["upstream_other_4xx",                 "other 4xx",                "bad"],
+    ["upstream_4xx",                       "4xx in total",             "bad"],
+    ["upstream_5xx",                       "5xx",                      "bad"],
+    ["retry_after_added",                  "retry-after supplied here", "note"],
+    ["rate_limit_converted",               "rate limits converted",    "note"],
+    ["effort_thinking_validation_errors",  "effort/thinking rejected",  "bad"],
+  ]],
+  ["gRecovery", [
+    ["recovery_checkpoints_saved",     "checkpoints saved",        ""],
+    ["recovery_checkpoint_hits",       "checkpoint hits",          "good"],
+    ["recovery_checkpoint_misses",     "checkpoint misses",        "note"],
+    ["upstream_400_content_blocked",   "blocked by content filter", "bad"],
+    ["content_blocked_events",         "blocks recorded",          "bad"],
+    ["content_blocked_sessions",       "sessions affected",        "bad"],
+  ]],
+];
+
+const POLL_MS = 2500;
+const TRACE_SPAN_MIN = 60;    // never squeeze the trace tighter than a minute
+const TRACE_SPAN_MAX = 300;   // never show more history than five
+const RATE_WINDOW_S = 300;
+const LIVE_WINDOW_S = 60;     // "passing traffic" means a request this recently
+const FEED_MAX = 260;
+const FEED_TEXT_MAX = 150;    // request-shape lines run long; the rest goes in the tooltip
+const NICE_SECONDS = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 240];
+
+const state = {
+  seq: 0, origin: null, events: [],
+  paused: false, problemsOnly: false,
+  lastOk: 0, offline: false, stats: null,
+};
+
+const $ = (id) => document.getElementById(id);
+const rowNodes = new Map();   // metric key -> {row, value}
+
+// ---------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------
+
+const num = (n) => (typeof n === "number" ? n.toLocaleString("en-US") : "—");
+
+function bytes(n) {
+  if (typeof n !== "number") return "—";
+  if (n < 1024) return n + " B";
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let v = n / 1024, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (v < 10 ? v.toFixed(1) : Math.round(v)) + " " + units[i];
+}
+
+function duration(s) {
+  if (typeof s !== "number") return "—";
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600);
+  const m = Math.floor(s % 3600 / 60), sec = Math.floor(s % 60);
+  if (d) return d + "d " + h + "h";
+  if (h) return h + "h " + m + "m";
+  if (m) return m + "m " + sec + "s";
+  return sec + "s";
+}
+
+function clock(epochSeconds) {
+  const d = new Date(epochSeconds * 1000);
+  return String(d.getHours()).padStart(2, "0") + ":" +
+         String(d.getMinutes()).padStart(2, "0") + ":" +
+         String(d.getSeconds()).padStart(2, "0");
+}
+
+function host(url) {
+  if (!url) return "—";
+  try { return new URL(url).host; } catch (e) { return url; }
+}
+
+// ---------------------------------------------------------------------------
+// Metric rows: built once, then only values and classes change, so selecting
+// text in the panel survives a refresh.
+// ---------------------------------------------------------------------------
+
+function buildRows() {
+  for (const [containerId, rows] of GROUPS) {
+    const container = $(containerId);
+    const frag = document.createDocumentFragment();
+    for (const [key, label] of rows) {
+      const row = document.createElement("div");
+      row.className = "m zero";
+      const k = document.createElement("span"); k.className = "k"; k.textContent = label;
+      const lead = document.createElement("span"); lead.className = "lead";
+      const v = document.createElement("span"); v.className = "v"; v.textContent = "—";
+      row.append(k, lead, v);
+      frag.append(row);
+      rowNodes.set(key, { row, value: v });
+    }
+    container.append(frag);
+  }
+}
+
+function paintRows(stats) {
+  for (const [, rows] of GROUPS) {
+    for (const [key, , polarity] of rows) {
+      const node = rowNodes.get(key);
+      if (!node) continue;
+      const raw = stats[key];
+      const zero = !raw;
+      node.value.textContent = polarity === "bytes" ? bytes(raw) : num(raw);
+      let cls = "m";
+      if (zero) cls += " zero";
+      else if (polarity === "bad") cls += " hit";
+      else if (polarity === "good") cls += " good";
+      else if (polarity === "note") cls += " note";
+      node.row.className = cls;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The trace. Above the baseline: how long each delivered stream took. Below:
+// failures and replays. An empty upper band with marks below means the relay is
+// being asked for work it cannot finish.
+// ---------------------------------------------------------------------------
+
+const BASE_PCT = 68;   // baseline sits here, leaving a third for the downward marks
+
+// Both axes follow the data. A fixed 5-minute window with a 240 s ceiling drew
+// a flat smear against the corner whenever traffic was recent and quick, which
+// is exactly when the panel is being read. The window starts at the oldest mark
+// rather than the oldest log line, so a proxy that idled after startup doesn't
+// spend a third of the trace on empty ground.
+function traceView() {
+  const now = Date.now() / 1000;
+  let oldest = null;
+  for (const ev of state.events) {
+    if (!markFor(ev)) continue;
+    oldest = ev.t;
+    break;
+  }
+
+  const span = oldest === null
+    ? TRACE_SPAN_MAX
+    : Math.min(TRACE_SPAN_MAX, Math.max(TRACE_SPAN_MIN, (now - oldest) * 1.12));
+  const from = now - span;
+
+  let longest = 0;
+  for (const ev of state.events) {
+    if (ev.t >= from && typeof ev.seconds === "number" && ev.seconds > longest) longest = ev.seconds;
+  }
+  return { now, span, from, ceil: nice(Math.max(longest * 1.15, 2)) };
+}
+
+function nice(seconds) {
+  return NICE_SECONDS.find((n) => n >= seconds) || NICE_SECONDS[NICE_SECONDS.length - 1];
+}
+
+function guidesFor(ceil) {
+  return [...new Set([ceil, ceil / 4, ceil / 16].filter((s) => s >= 0.5).map(nice))];
+}
+
+function traceHeight(seconds, ceil) {
+  const capped = Math.min(Math.max(seconds, 0), ceil);
+  return Math.sqrt(capped / ceil);   // a 1 s stream stays visible beside a 240 s one
+}
+
+function markFor(ev) {
+  if (typeof ev.seconds === "number") return { dir: "up", seconds: ev.seconds, cls: "up" };
+  if (ev.text.startsWith("recovered on attempt")) return { dir: "up", frac: .5, cls: "replay" };
+  if (ev.text.startsWith("non-stream response OK")) return { dir: "up", frac: .18, cls: "up" };
+  if (ev.kind === "fail") return { dir: "down", frac: .8, cls: "down" };
+  if (ev.text.startsWith("retrying in")) return { dir: "down", frac: .34, cls: "hold" };
+  if (ev.text.startsWith("client disconnected")) return { dir: "down", frac: .22, cls: "hold" };
+  return null;
+}
+
+function drawTrace() {
+  const box = $("trace");
+  const view = traceView();
+
+  box.textContent = "";
+
+  const base = document.createElement("div");
+  base.className = "base";
+  base.style.top = BASE_PCT + "%";
+  box.append(base);
+
+  for (const g of guidesFor(view.ceil)) {
+    const line = document.createElement("div");
+    line.className = "guide";
+    line.style.top = (BASE_PCT - traceHeight(g, view.ceil) * BASE_PCT) + "%";
+    const tag = document.createElement("span");
+    tag.textContent = g + "s";
+    line.append(tag);
+    box.append(line);
+  }
+
+  let drawn = 0;
+  for (const ev of state.events) {
+    if (ev.t < view.from) continue;
+    const mark = markFor(ev);
+    if (!mark) continue;
+    const frac = mark.seconds !== undefined ? traceHeight(mark.seconds, view.ceil) : mark.frac;
+    const x = (ev.t - view.from) / view.span * 100;
+    const tick = document.createElement("div");
+    tick.className = "tick " + mark.cls;
+    tick.style.left = "calc(" + x.toFixed(2) + "% - 2px)";
+    if (mark.dir === "up") {
+      const h = Math.max(frac * BASE_PCT, 2);
+      tick.style.top = (BASE_PCT - h) + "%";
+      tick.style.height = h + "%";
+    } else {
+      const h = Math.max(frac * (100 - BASE_PCT), 2);
+      tick.style.top = BASE_PCT + "%";
+      tick.style.height = h + "%";
+    }
+    box.append(tick);
+    drawn++;
+  }
+
+  if (!drawn) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = state.events.length ? "No traffic in this window" : "No traffic yet";
+    box.append(empty);
+  }
+
+  $("axisLeft").textContent = view.span >= 90
+    ? Math.round(view.span / 60) + " min ago"
+    : Math.round(view.span) + " s ago";
+}
+
+// ---------------------------------------------------------------------------
+// Feed
+// ---------------------------------------------------------------------------
+
+const GLYPH = { request: "→", ok: "✓", warn: "!", fail: "×", info: "·" };
+
+function feedRow(ev) {
+  const row = document.createElement("div");
+  row.className = "row " + ev.kind;
+  const t = document.createElement("span"); t.className = "t"; t.textContent = clock(ev.t);
+  const g = document.createElement("span"); g.className = "g"; g.textContent = GLYPH[ev.kind] || "·";
+  const x = document.createElement("span"); x.className = "x";
+  if (ev.text.length > FEED_TEXT_MAX) {
+    x.textContent = ev.text.slice(0, FEED_TEXT_MAX - 1) + "…";
+    x.title = ev.text;
+  } else {
+    x.textContent = ev.text;
+  }
+  row.append(t, g, x);
+  return row;
+}
+
+function drawFeed() {
+  const body = $("feedBody");
+  const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 24;
+  const shown = state.problemsOnly
+    ? state.events.filter((e) => e.kind === "warn" || e.kind === "fail")
+    : state.events;
+
+  body.textContent = "";
+  if (!shown.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = state.problemsOnly
+      ? "No warnings or failures in the buffer. Nothing to look at is the good outcome."
+      : "Nothing logged yet. Lines appear here as Claude Code uses the relay.";
+    body.append(empty);
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  for (const ev of shown.slice(-FEED_MAX)) frag.append(feedRow(ev));
+  body.append(frag);
+  if (atBottom) body.scrollTop = body.scrollHeight;
+}
+
+// ---------------------------------------------------------------------------
+// Header, tallies, recovery
+// ---------------------------------------------------------------------------
+
+function paintHead(health, stats) {
+  const busy = recentRequests(LIVE_WINDOW_S) > 0;
+  $("state").textContent = busy ? "Passing traffic" : "Quiet";
+  $("uptime").textContent = duration(stats.uptime_seconds);
+  $("mode").textContent = health.stream_mode + (health.stream_mode === "reliable"
+    ? " · buffered" : " · live");
+  $("hopSelf").textContent = health.listen || "127.0.0.1";
+  $("hopUp").textContent = host(health.upstream || stats.upstream);
+  $("hopUp").title = health.upstream || stats.upstream || "";
+
+  document.body.classList.toggle("live", busy);
+  document.body.classList.toggle("idle", !busy);
+}
+
+function tally(id, value, cls) {
+  const node = $(id);
+  node.textContent = num(value);
+  node.parentElement.className = "tally" + (value ? (cls ? " " + cls : "") : " zero");
+}
+
+function recentRequests(seconds) {
+  const from = Date.now() / 1000 - seconds;
+  let n = 0;
+  for (const ev of state.events) if (ev.kind === "request" && ev.t >= from) n++;
+  return n;
+}
+
+function paintTallies(stats) {
+  tally("tRequests", stats.total_requests, "");
+  tally("tClean", stats.successful_requests, "");
+  tally("tReplayed", stats.reliable_stream_recovered + stats.retries_successful, "warn");
+  tally("tFailed", stats.failed_requests, "bad");
+
+  const inWindow = recentRequests(RATE_WINDOW_S);
+  $("rate").textContent = inWindow
+    ? inWindow + " request" + (inWindow === 1 ? "" : "s") + " in the last "
+      + Math.round(RATE_WINDOW_S / 60) + " min"
+    : "quiet for the last " + Math.round(RATE_WINDOW_S / 60) + " min";
+}
+
+const REC_STATE = {
+  ready: ["Ready", ""],
+  content_blocked: ["Content blocked", "bad"],
+  no_checkpoint: ["No checkpoint", "idle"],
+};
+
+function paintRecovery(rec) {
+  const [label, cls] = REC_STATE[rec.status] || [rec.status, "idle"];
+  const badge = $("recState");
+  badge.textContent = label;
+  badge.className = "badge" + (cls ? " " + cls : "");
+
+  $("recHeld").textContent = rec.checkpoints_held + " of " + rec.max_checkpoints;
+  const slots = $("recSlots");
+  if (slots.childElementCount !== rec.max_checkpoints) {
+    slots.textContent = "";
+    for (let i = 0; i < rec.max_checkpoints; i++) slots.append(document.createElement("i"));
+  }
+  [...slots.children].forEach((el, i) => { el.className = i < rec.checkpoints_held ? "on" : ""; });
+
+  $("recAction").textContent = rec.suggested_action || "—";
+  $("recNotice").textContent = rec.notice || "";
+}
+
+// ---------------------------------------------------------------------------
+// Polling
+// ---------------------------------------------------------------------------
+
+async function getJSON(url) {
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(url + " answered " + res.status);
+  return res.json();
+}
+
+function setOffline(off) {
+  state.offline = off;
+  document.body.classList.toggle("offline", off);
+  if (off) {
+    $("state").textContent = "No answer";
+    document.body.classList.remove("live");
+  }
+}
+
+async function poll() {
+  try {
+    const [health, stats, rec, feed] = await Promise.all([
+      getJSON("/_health"),
+      getJSON("/_stats"),
+      getJSON("/_recovery"),
+      getJSON("/_events?after=" + state.seq + "&limit=300"),
+    ]);
+
+    if (state.origin !== null && feed.origin !== state.origin) {
+      state.events = [];            // the relay restarted; its history is not ours
+      state.seq = 0;
+    }
+    state.origin = feed.origin;
+    if (feed.events.length) {
+      state.events.push(...feed.events);
+      state.seq = feed.events[feed.events.length - 1].seq;
+      if (state.events.length > FEED_MAX * 2) state.events.splice(0, state.events.length - FEED_MAX * 2);
+    }
+
+    state.stats = stats;
+    state.lastOk = Date.now();
+    setOffline(false);
+
+    paintHead(health, stats);
+    paintTallies(stats);
+    paintRows(stats);
+    paintRecovery(rec);
+    drawTrace();
+    drawFeed();
+  } catch (e) {
+    setOffline(true);
+  }
+  paintAgo();
+}
+
+function paintAgo() {
+  if (!state.lastOk) { $("ago").textContent = "—"; return; }
+  const secs = Math.round((Date.now() - state.lastOk) / 1000);
+  $("ago").textContent = state.paused
+    ? "paused"
+    : (secs < 3 ? "just now" : secs + "s ago");
+}
+
+let timer = null;
+function schedule() {
+  clearInterval(timer);
+  if (!state.paused) timer = setInterval(poll, POLL_MS);
+}
+
+// The trace slides left between polls, so it reads as a moving gauge rather
+// than a chart that jumps every 2.5 s.
+setInterval(() => {
+  if (!state.paused && !document.hidden && state.events.length) drawTrace();
+  paintAgo();
+}, 1000);
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && !state.paused) poll();
+});
+
+// ---------------------------------------------------------------------------
+// Controls
+// ---------------------------------------------------------------------------
+
+function setFilter(problemsOnly) {
+  state.problemsOnly = problemsOnly;
+  $("fAll").setAttribute("aria-pressed", String(!problemsOnly));
+  $("fProblems").setAttribute("aria-pressed", String(problemsOnly));
+  drawFeed();
+}
+
+function setPaused(paused) {
+  state.paused = paused;
+  const b = $("pause");
+  b.setAttribute("aria-pressed", String(paused));
+  b.textContent = paused ? "Resume" : "Pause";
+  schedule();
+  if (!paused) poll();
+  paintAgo();
+}
+
+// ---------------------------------------------------------------------------
+// Theme. The head script already applied it; this only labels the switch and
+// remembers a change. The button names the theme it switches to, not the one
+// in effect.
+// ---------------------------------------------------------------------------
+
+function setTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  try { localStorage.setItem("relay-theme", theme); } catch (e) { /* private mode */ }
+  const b = $("theme");
+  const next = theme === "dark" ? "Light" : "Dark";
+  b.textContent = next;
+  b.title = "Switch to the " + next.toLowerCase() + " theme (t)";
+}
+
+function toggleTheme() {
+  setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+}
+
+$("fAll").onclick = () => setFilter(false);
+$("fProblems").onclick = () => setFilter(true);
+$("pause").onclick = () => setPaused(!state.paused);
+$("theme").onclick = toggleTheme;
+
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" || e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === "p") setPaused(!state.paused);
+  else if (k === "f") setFilter(!state.problemsOnly);
+  else if (k === "r") poll();
+  else if (k === "t") toggleTheme();
+});
+
+setTheme(document.documentElement.dataset.theme === "light" ? "light" : "dark");
+buildRows();
+poll();
+schedule();
+</script>
+</body>
+</html>

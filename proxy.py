@@ -48,11 +48,12 @@ import secrets
 import time
 from collections import OrderedDict, deque
 from email.utils import parsedate_tz
+from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Optional
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 # ----------------------------------------------------------------------------
 # Configuration (all overridable by environment, no secrets in source)
@@ -1987,7 +1988,7 @@ async def root() -> JSONResponse:
             "status": "running",
             "upstream": UPSTREAM,
             "endpoints": ["/v1/messages", "/v1/messages?beta=true", "/_stats",
-                          "/_health", "/_recovery", "/_events"],
+                          "/_health", "/_recovery", "/_events", "/_ui"],
         }
     )
 
@@ -2014,6 +2015,36 @@ async def events(after: int = 0, limit: int = 200) -> JSONResponse:
         "gap": bool(after and _EVENTS and _EVENTS[0]["seq"] > after + 1),
         "events": selected,
     })
+
+
+# Served from a file rather than a string constant so the panel can be edited
+# and reloaded with F5, without restarting a proxy that is carrying live traffic.
+_UI_PATH = Path(__file__).resolve().parent / "ui" / "panel.html"
+_UI_CACHE: dict[str, Any] = {"mtime": None, "html": ""}
+
+_UI_MISSING = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Panel missing</title>
+<style>body{background:#0d1620;color:#d5e2ee;font:14px ui-monospace,Consolas,monospace;
+padding:48px;line-height:1.7}code{color:#e3a441}</style></head><body>
+<p>The panel file is not installed.</p>
+<p>Expected it at <code>ui/panel.html</code>, next to <code>proxy.py</code>.</p>
+<p>The proxy itself is unaffected. Machine-readable status stays at
+<code>/_health</code>, <code>/_stats</code>, <code>/_recovery</code> and
+<code>/_events</code>.</p></body></html>"""
+
+
+@app.get("/_ui", response_class=HTMLResponse)
+async def ui() -> HTMLResponse:
+    """The monitoring panel."""
+    try:
+        mtime = _UI_PATH.stat().st_mtime
+    except OSError:
+        return HTMLResponse(_UI_MISSING, status_code=503)
+
+    if _UI_CACHE["mtime"] != mtime:
+        _UI_CACHE["html"] = _UI_PATH.read_text(encoding="utf-8")
+        _UI_CACHE["mtime"] = mtime
+    return HTMLResponse(_UI_CACHE["html"], headers={"cache-control": "no-store"})
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
