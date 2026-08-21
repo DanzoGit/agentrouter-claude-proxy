@@ -43,9 +43,10 @@ import codecs
 import hashlib
 import json
 import os
+import re
 import secrets
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from email.utils import parsedate_tz
 from typing import Any, AsyncIterator, Iterable, Optional
 
@@ -258,13 +259,99 @@ def bump(key: str, n: int = 1) -> None:
 # Logging (never emits credentials)
 # ----------------------------------------------------------------------------
 
+# /_events serves the proxy's own log lines out of this ring buffer rather than
+# off disk: no filesystem path becomes reachable over HTTP, and the feed reads
+# the same whether start-proxy.ps1 launched the proxy or a bare uvicorn did.
+# Nothing lands here that print() would not already have written to the
+# terminal, minus the masking below.
+EVENT_BUFFER = max(50, int(os.environ.get("PROXY_EVENT_BUFFER", "600")))
+
+_EVENTS: deque[dict[str, Any]] = deque(maxlen=EVENT_BUFFER)
+_EVENT_SEQ = 0
+
+# key_fingerprint() prints the last four characters of a credential. That is
+# fine in a terminal the operator already owns; it is not something to serve
+# over HTTP, so it is masked on the way into the buffer.
+_SECRET_MASKS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"tail=\.\.\.\S{1,8}"), "tail=...****"),
+    (re.compile(r"sk-ant-[A-Za-z0-9_\-]{4,}"), "sk-ant-****"),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{4,}"), "Bearer ****"),
+)
+
+# What a reader groups a line under. First match wins, so failure phrasings come
+# before the generic status lines they would otherwise be swallowed by.
+_EVENT_KINDS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^(?:GET|POST|PUT|PATCH|DELETE|OPTIONS) \S+ ->"), "request"),
+    (re.compile(r"^(?:final failure|all \d+ attempts failed|non-transient failure"
+                r"|no credential available|post-commit|HTTP 5\d\d)"), "fail"),
+    (re.compile(r"^(?:retrying in|invalid response|discarding unusable"
+                r"|client disconnected|upstream \d+ carried no usable"
+                r"|forwarding upstream HTTP|HTTP 4\d\d|content blocked)"), "warn"),
+    (re.compile(r"^(?:HTTP 2\d\d|stream complete|buffered stream complete"
+                r"|valid Anthropic SSE"
+                r"|forwarding stream|non-stream response OK"
+                r"|recovered on attempt)"), "ok"),
+)
+
+_STREAM_DONE_RE = re.compile(r"^stream complete: (\d+) frames in ([\d.]+)s")
+_BUFFERED_DONE_RE = re.compile(r"^buffered stream complete: (\d+) bytes in ([\d.]+)s")
+_HTTP_STATUS_RE = re.compile(r"^HTTP (\d{3})")
+_REQUEST_RE = re.compile(r"^(GET|POST|PUT|PATCH|DELETE|OPTIONS) (\S+) ->")
+
+
+def mask_secrets(msg: str) -> str:
+    for pattern, replacement in _SECRET_MASKS:
+        msg = pattern.sub(replacement, msg)
+    return msg
+
+
+def record_event(msg: str) -> None:
+    """Keep a masked, classified copy of a log line for /_events."""
+    global _EVENT_SEQ
+    if msg.startswith("=========="):  # separator: useful in a terminal, noise in a feed
+        return
+
+    text = mask_secrets(msg)
+    kind = "info"
+    for pattern, name in _EVENT_KINDS:
+        if pattern.match(text):
+            kind = name
+            break
+
+    _EVENT_SEQ += 1
+    event: dict[str, Any] = {"seq": _EVENT_SEQ, "t": round(time.time(), 3),
+                             "kind": kind, "text": text}
+
+    # Extras worth having without re-parsing the text downstream: a finished
+    # stream carries how long it took, a request line its method and path, a
+    # status line its code.
+    done = _STREAM_DONE_RE.match(text)
+    if done:
+        event["frames"] = int(done.group(1))
+        event["seconds"] = float(done.group(2))
+    buffered = _BUFFERED_DONE_RE.match(text)
+    if buffered:
+        event["bytes"] = int(buffered.group(1))
+        event["seconds"] = float(buffered.group(2))
+    status = _HTTP_STATUS_RE.match(text)
+    if status:
+        event["status"] = int(status.group(1))
+    request = _REQUEST_RE.match(text)
+    if request:
+        event["method"] = request.group(1)
+        event["path"] = request.group(2)
+
+    _EVENTS.append(event)
+
 
 def log(msg: str) -> None:
+    record_event(msg)
     print(f"[proxy] {msg}", flush=True)
 
 
 def vlog(msg: str) -> None:
     if VERBOSE:
+        record_event(msg)
         print(f"[proxy] {msg}", flush=True)
 
 
@@ -1900,14 +1987,39 @@ async def root() -> JSONResponse:
             "status": "running",
             "upstream": UPSTREAM,
             "endpoints": ["/v1/messages", "/v1/messages?beta=true", "/_stats",
-                          "/_health", "/_recovery"],
+                          "/_health", "/_recovery", "/_events"],
         }
     )
+
+
+@app.get("/_events")
+async def events(after: int = 0, limit: int = 200) -> JSONResponse:
+    """
+    Masked log lines as a feed, oldest first.
+
+    `after` is the highest seq the caller already holds, so polling costs one
+    small payload rather than the whole buffer. `origin` changes when the proxy
+    restarts, which tells the caller its history no longer belongs to this
+    process. `gap` is true when the ring buffer discarded lines the caller
+    never saw.
+    """
+    limit = max(1, min(limit, EVENT_BUFFER))
+    after = max(0, after)
+    selected = [e for e in _EVENTS if e["seq"] > after][-limit:]
+    return JSONResponse({
+        "origin": round(_STARTED_AT, 3),
+        "seq": _EVENT_SEQ,
+        "buffered": len(_EVENTS),
+        "capacity": EVENT_BUFFER,
+        "gap": bool(after and _EVENTS and _EVENTS[0]["seq"] > after + 1),
+        "events": selected,
+    })
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def proxy(request: Request, path: str) -> Response:
     bump("total_requests")
+    started = time.monotonic()
 
     raw_body = await request.body()
     body, stripped, stream_requested = sanitize_body(raw_body)
@@ -2018,6 +2130,12 @@ async def proxy(request: Request, path: str) -> Response:
     if result.is_sse and result.body is not None:
         bump("successful_requests")
         save_checkpoint(pending, True)
+        # The buffered mode returned without a word in the log until now, so a
+        # completed turn left no trace and no timing anywhere. Frames are not
+        # counted on this path -- the stream arrives as one body -- so the line
+        # reports the bytes handed to the client instead.
+        log(f"buffered stream complete: {len(result.body)} bytes in "
+            f"{time.monotonic() - started:.1f}s")
         out_headers = passthrough_headers(result.headers)
         out_headers["cache-control"] = "no-cache"
         return Response(content=result.body, status_code=result.status,
