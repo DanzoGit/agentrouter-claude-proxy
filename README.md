@@ -120,7 +120,8 @@ the internet.
   the upstream connection is closed rather than leaked.
 - **`/_health` and `/_stats` endpoints** for liveness and counters.
 - **A monitoring panel at `/_ui`**, over a `/_events` feed of the proxy's own log
-  lines. It loads nothing from the network and polls no host but this proxy.
+  lines. It loads nothing from the network and polls no host but this proxy, and
+  every line is masked before it enters the feed.
 - **Single-instance protection** — starting it twice on the same port is a
   no-op, not a crash.
 - **Loopback-only** — binds `127.0.0.1` and nothing else.
@@ -396,7 +397,11 @@ true when the buffer discarded lines that caller never saw. Set
 
 The page loads nothing from the network — no fonts, no scripts, no icons — and
 talks to no host but this proxy. Credentials are masked before a line enters the
-buffer, so a key fingerprint stays in the terminal where it was printed.
+buffer, so a key fingerprint stays in the terminal where it was printed. A
+credential that arrives as a query parameter is redacted where the request line
+is built: `?api_key=sk-…` is recorded as `?api_key=****`, keeping the parameter
+name — which is the diagnosable half — while the value reaches neither the feed
+nor `logs/proxy.log`. The upstream still receives the query byte-for-byte.
 `ui/panel.html` is read from disk per request when its timestamp changes, so
 editing the page and pressing F5 is enough; the proxy keeps running. If the file
 is missing the proxy is unaffected and `/_ui` says so.
@@ -575,7 +580,10 @@ This matters more than the feature list, so it is spelled out plainly.
   visible error is better than a silently duplicated tool call.
 - **It never logs credentials, prompts, or model output.** Logs contain event
   types, frame counts, drop reasons, and status codes. Where a credential must
-  be mentioned at all, only its length is printed.
+  be mentioned at all, only its length is printed. A credential that arrives in
+  a query string, in a header, or in the configured upstream address is redacted
+  before the line is built, and an unusable upstream body is described by shape —
+  event names, byte counts, JSON keys — never quoted.
 
 In short: this handles transport and stream-format compatibility, plus transient
 malformed responses. Everything else is passed through honestly.
@@ -594,8 +602,12 @@ malformed responses. Everything else is passed through honestly.
   should never be committed to any repository.
 - Logs are bounded and rotate. They contain no sensitive content.
 - The panel at `/_ui` requests nothing from the network and polls no host but
-  this proxy. The log lines it reads are masked on their way into memory, so a
-  credential fingerprint printed to the terminal is not served over HTTP.
+  this proxy. Log lines are masked on their way into memory, so nothing served
+  over HTTP carries a credential: key fingerprints, `sk-ant-…` values, `Bearer`
+  values, sensitive query parameters, and userinfo or a key in the configured
+  upstream address are all redacted. Parameter and header *names* are kept, so
+  the feed stays useful. `tests/run-tests.ps1` asserts this with canary values
+  it then looks for across `/_events`, `/_stats`, `/_health` and `/`.
 
 ---
 

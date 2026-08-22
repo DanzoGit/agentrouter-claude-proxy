@@ -198,6 +198,22 @@ STRIP_RESPONSE_HEADERS = HOP_BY_HOP | {"content-encoding"}
 SENSITIVE_HEADERS = {"authorization", "x-api-key", "api-key", "cookie", "set-cookie",
                      "proxy-authorization", "x-goog-api-key"}
 
+# A header the list above does not know by name is still a credential if it
+# reads like one. Matched as a substring so x-auth-token or x-vendor-secret is
+# covered without enumerating every vendor's spelling; "key" alone is left out
+# deliberately, or idempotency-key would be redacted for nothing.
+_SENSITIVE_HEADER_HINTS = ("authorization", "api-key", "apikey", "token", "secret",
+                           "password", "credential", "cookie", "signature")
+
+# Query parameters that carry a credential rather than a routing detail. The
+# NAME decides and the value is never inspected, so the redaction is predictable
+# and a value that happens to look harmless cannot slip through.
+SENSITIVE_QUERY_KEYS = frozenset({
+    "api_key", "apikey", "key", "access_token", "refresh_token", "id_token",
+    "token", "auth", "authorization", "secret", "client_secret", "password",
+    "passwd", "pwd", "signature", "sig", "credential", "credentials",
+})
+
 # ----------------------------------------------------------------------------
 # Counters
 # ----------------------------------------------------------------------------
@@ -273,10 +289,24 @@ _EVENT_SEQ = 0
 # key_fingerprint() prints the last four characters of a credential. That is
 # fine in a terminal the operator already owns; it is not something to serve
 # over HTTP, so it is masked on the way into the buffer.
+#
+# The last pattern is a net rather than the first line of defence. A credential
+# arriving as a query parameter is redacted where the request line is built (see
+# redact_query), which keeps it out of the terminal and out of logs/proxy.log as
+# well; this catches any later line that interpolates a name=value pair without
+# going through that helper. The name survives the substitution: knowing that a
+# caller passed api_key is the diagnosable half, its value never is.
 _SECRET_MASKS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"tail=\.\.\.\S{1,8}"), "tail=...****"),
+    (re.compile(r"tail=\.\.\.[^\s>]{1,8}"), "tail=...****"),
     (re.compile(r"sk-ant-[A-Za-z0-9_\-]{4,}"), "sk-ant-****"),
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{4,}"), "Bearer ****"),
+    # (?<!\w) keeps max_tokens=1024 and stream=True readable -- an underscore or
+    # letter in front means this is a longer word, not one of these names -- while
+    # still reaching the value in x-api-key=... and refresh-token=...
+    (re.compile(r"(?i)(?<!\w)(api[-_]?key|access[-_]?token|refresh[-_]?token"
+                r"|id[-_]?token|client[-_]?secret|authorization|auth|token"
+                r"|secret|password|passwd|pwd|signature|credentials?)"
+                r"=([^&\s\"']+)"), r"\1=****"),
 )
 
 # What a reader groups a line under. First match wins, so failure phrasings come
@@ -356,15 +386,73 @@ def vlog(msg: str) -> None:
         print(f"[proxy] {msg}", flush=True)
 
 
+def is_sensitive_header(name: str) -> bool:
+    """Whether this header's value must never be printed."""
+    lowered = name.lower()
+    return (lowered in SENSITIVE_HEADERS
+            or any(hint in lowered for hint in _SENSITIVE_HEADER_HINTS))
+
+
 def redact_headers(headers: dict[str, str]) -> dict[str, str]:
     """Header names preserved, sensitive values replaced by a length hint."""
     out: dict[str, str] = {}
     for k, v in headers.items():
-        if k.lower() in SENSITIVE_HEADERS:
+        if is_sensitive_header(k):
             out[k] = f"<redacted len={len(v)}>"
         else:
             out[k] = v
     return out
+
+
+def redact_query(query: str) -> str:
+    """
+    A query string safe to print: credential values gone, parameter names kept.
+
+    The upstream still receives the query verbatim -- this is only what the
+    terminal, logs/proxy.log and /_events get to see. Names survive because they
+    are the diagnosable half: that a caller passed api_key at all is worth
+    seeing, its value never is. Only the names in SENSITIVE_QUERY_KEYS are
+    touched, so beta=true stays readable.
+
+    The placeholder holds no spaces on purpose: a request line is parsed back
+    into method and path by whitespace (see _REQUEST_RE), and a length hint like
+    the one redact_headers uses would split the path in two.
+    """
+    if not query:
+        return query
+    parts: list[str] = []
+    for part in query.split("&"):
+        name, sep, value = part.partition("=")
+        if sep and value and name.strip().lower().replace("-", "_") in SENSITIVE_QUERY_KEYS:
+            parts.append(f"{name}=****")
+        else:
+            parts.append(part)
+    return "&".join(parts)
+
+
+def safe_upstream(url: str) -> str:
+    """
+    The upstream address in a form that is safe to print.
+
+    A base URL is normally credential-free, but nothing stops an operator from
+    configuring one that carries userinfo or a key in the query string -- and
+    this string is printed at startup, on every request line, and served by
+    /_health, /_stats and /. The address the requests actually go to is built
+    from UPSTREAM itself; only what gets shown passes through here.
+    """
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        scheme, rest = "", url
+    authority, slash, tail = rest.partition("/")
+    if "@" in authority:  # user:password@host
+        authority = f"****@{authority.rsplit('@', 1)[1]}"
+    path, qmark, query = tail.partition("?")
+    shown = f"{scheme}{sep}{authority}{slash}{path}"
+    return f"{shown}?{redact_query(query)}" if qmark else shown
+
+
+# Computed once: every place that prints the upstream uses this, never UPSTREAM.
+UPSTREAM_SAFE = safe_upstream(UPSTREAM)
 
 
 def key_fingerprint(key: str) -> str:
@@ -404,6 +492,21 @@ def preview(body: bytes, limit: int = 160) -> str:
         return f"<json {type(parsed).__name__}>"
     except (json.JSONDecodeError, ValueError):
         pass
+
+    # A truncated SSE stream is not JSON, so without this it would fall through
+    # to the raw head below -- and the head of a stream is where completion text
+    # lives. Event names answer the diagnostic question ("how far did it get?")
+    # without reading a single data payload.
+    if stripped.startswith("event:") or stripped.startswith("data:"):
+        names: list[str] = []
+        frames = 0
+        for line in stripped.split("\n"):
+            if line.startswith("event:"):
+                names.append(line[6:].strip())
+            elif line.startswith("data:"):
+                frames += 1
+        ordered = ",".join(list(dict.fromkeys(n for n in names if n))[:8]) or "<unnamed>"
+        return f"<sse {len(body)}B, frames={frames}, events={ordered}>"
 
     collapsed = " ".join(stripped.split())
     return f"<non-json {len(body)}B: {collapsed[:limit]!r}>"
@@ -1948,7 +2051,7 @@ async def stats() -> JSONResponse:
     payload: dict[str, Any] = {
         **STATS,
         "uptime_seconds": round(time.time() - _STARTED_AT, 1),
-        "upstream": UPSTREAM,
+        "upstream": UPSTREAM_SAFE,
         "max_attempts": MAX_ATTEMPTS,
         "backoff_base_ms": BACKOFF_BASE_MS,
         "prime_timeout_s": PRIME_TIMEOUT_S,
@@ -1975,7 +2078,7 @@ async def recovery() -> JSONResponse:
 
 @app.get("/_health")
 async def health() -> JSONResponse:
-    return JSONResponse({"status": "ok", "upstream": UPSTREAM,
+    return JSONResponse({"status": "ok", "upstream": UPSTREAM_SAFE,
                          "listen": f"{LISTEN_HOST}:{PORT}",
                          "stream_mode": STREAM_MODE,
                          "reliable_max_bytes": RELIABLE_MAX_BYTES})
@@ -1986,7 +2089,7 @@ async def root() -> JSONResponse:
     return JSONResponse(
         {
             "status": "running",
-            "upstream": UPSTREAM,
+            "upstream": UPSTREAM_SAFE,
             "endpoints": ["/v1/messages", "/v1/messages?beta=true", "/_stats",
                           "/_health", "/_recovery", "/_events", "/_ui"],
         }
@@ -2059,9 +2162,14 @@ async def proxy(request: Request, path: str) -> Response:
     url = f"{UPSTREAM}/{path}" + (f"?{query}" if query else "")
     is_messages = path.rstrip("/") == "v1/messages"
 
+    # The upstream gets `url`; every line below gets the redacted twin. A client
+    # that puts its credential in the query string would otherwise write it to
+    # the terminal, to logs/proxy.log and -- through record_event -- to /_events.
+    safe_suffix = f"?{redact_query(query)}" if query else ""
+
     log("=" * 62)
-    log(f"{request.method} /{path}{('?' + query) if query else ''} "
-        f"-> {url}  stream={stream_requested}")
+    log(f"{request.method} /{path}{safe_suffix} "
+        f"-> {UPSTREAM_SAFE}/{path}{safe_suffix}  stream={stream_requested}")
     if stripped:
         log(f"stripped null request fields: {', '.join(stripped)}")
     if is_messages:
@@ -2272,7 +2380,7 @@ def describe_failure(result: AttemptResult) -> str:
     if reason.startswith("http_5"):
         return f"AgentRouter returned {reason.replace('http_', 'HTTP ')} on every attempt."
     if reason.startswith("connect:"):
-        return (f"Could not reach {UPSTREAM} after {MAX_ATTEMPTS} attempts "
+        return (f"Could not reach {UPSTREAM_SAFE} after {MAX_ATTEMPTS} attempts "
                 f"({reason.split(':', 1)[1]}).")
     if reason in ("empty_stream", "empty_body", "empty_body_stream_requested", "null_body"):
         return (f"AgentRouter returned HTTP 200 with an empty response on all "
@@ -2304,6 +2412,6 @@ if __name__ == "__main__":
     else:
         log(f"credential loaded from environment {key_fingerprint(resolve_api_key())}")
 
-    log(f"upstream = {UPSTREAM}")
+    log(f"upstream = {UPSTREAM_SAFE}")
     log(f"listening on http://{LISTEN_HOST}:{PORT} (loopback only)")
     uvicorn.run(app, host=LISTEN_HOST, port=PORT, log_level="warning", access_log=False)
