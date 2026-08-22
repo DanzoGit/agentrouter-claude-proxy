@@ -344,6 +344,23 @@ def client_will_json_parse(content_type: str) -> bool:
     return "application/json" in ct or "+json" in ct
 
 
+def json_body_expected(content_type: str) -> bool:
+    """
+    Whether a body under this content-type is still owed a JSON shape.
+
+    Genuine API replies arrive as application/json and, on some routes, as
+    text/plain -- AgentRouter has been observed serving a well-formed message
+    that way -- so both stay under the JSON contract, as does a reply that names
+    no type at all. A body that names some other type is not an API reply: the
+    upstream serves /favicon.ico as image/x-icon and a landing page as text/html.
+    Judging those as malformed JSON condemns a sound response.
+    """
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if not ct:
+        return True
+    return ct in ("application/json", "text/plain") or ct.endswith("+json")
+
+
 # ----------------------------------------------------------------------------
 # SSE framing
 # ----------------------------------------------------------------------------
@@ -848,13 +865,23 @@ async def reliable_stream_body(response: httpx.Response, client: httpx.AsyncClie
 # ----------------------------------------------------------------------------
 
 
-def validate_json_response(status: int, body: bytes, is_messages: bool) -> tuple[bool, str]:
+def validate_json_response(status: int, body: bytes, is_messages: bool,
+                           content_type: str = "") -> tuple[bool, str]:
     """
     Validate a non-streaming upstream body. Only HTTP 200 is validated for
     shape; non-2xx bodies are real errors and are forwarded verbatim.
     """
     if status != 200:
         return True, "non_200_forwarded_verbatim"
+
+    # A path outside the JSON API may legitimately answer with something else,
+    # and the catch-all route forwards every path. Parsing /favicon.ico's
+    # image/x-icon as JSON marks a sound 200 invalid, spends all three attempts
+    # re-fetching the same bytes and answers 502 -- which a client reads as a
+    # dead endpoint, and it reads it precisely while probing whether the endpoint
+    # is alive. The API's own replies are still held to the contract below.
+    if not is_messages and not json_body_expected(content_type):
+        return True, "non_json_content_type_forwarded_verbatim"
 
     if not body or not body.strip():
         bump("empty_200_responses")
@@ -1025,7 +1052,7 @@ async def attempt_upstream(
     response_headers = dict(response.headers)
     await close_quietly(response, client)
 
-    valid, reason = validate_json_response(status, raw, is_messages)
+    valid, reason = validate_json_response(status, raw, is_messages, content_type)
     if not valid:
         log(f"invalid response: {reason}")
         # A genuine upstream error object is a real rejection, not a transport
