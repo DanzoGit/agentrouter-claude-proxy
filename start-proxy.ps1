@@ -194,6 +194,13 @@ if missing:
     sys.exit(3)
 '@
 
+# Native stderr is piped into the log on purpose from here on. Under the
+# script-wide 'Stop' preference the first stderr line of a native command is
+# wrapped in an ErrorRecord and raised as a terminating NativeCommandError,
+# which would abort the script -- pip in particular writes notices there. The
+# preference is restored once native output stops being consumed.
+$ErrorActionPreference = 'Continue'
+
 # Fed over stdin (python -). Passing a multi-line script via -c lets PowerShell's
 # native-argument handling strip the embedded quotes and corrupt the source.
 $depOutput = $checkScript | & $python - 2>&1
@@ -212,6 +219,8 @@ if ($depExit -ne 0) {
     if ($LASTEXITCODE -ne 0) { Write-Err 'Dependencies still unavailable after install.'; exit 1 }
 }
 Write-Ok 'all dependencies present'
+
+$ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------------------
 # 4. Check for a credential -- never print its value
@@ -251,6 +260,19 @@ if ($keyVar) {
 # ---------------------------------------------------------------------------
 if ($Verbose_) { $env:PROXY_VERBOSE = '1' }
 
+# The proxy's diagnostics can carry U+FFFD: an unusable upstream body is decoded
+# with errors="replace" before a short preview of it is logged. On a console
+# whose codepage is not UTF-8 -- cp1251 here -- print() then raises
+# UnicodeEncodeError from inside the request handler, which turns a reported
+# upstream failure into a 500 and a traceback on stderr. UTF-8 with replacement
+# on the child's own streams keeps a diagnostic from ever breaking a request.
+$env:PYTHONIOENCODING = 'utf-8:replace'
+
+# And decode that child's output as UTF-8 on this side, so the bytes reaching the
+# log file are the ones Python wrote. Absent a console host this is unavailable,
+# which costs nothing but fidelity on non-ASCII log lines.
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
+
 # So /_health reports the address it is genuinely bound to, which is what the
 # single-instance guard above compares against.
 $env:PROXY_PORT = "$Port"
@@ -286,8 +308,22 @@ if ($Service) {
         # Merge uvicorn's stderr into the rotating log. Its output is startup
         # banners and the proxy's own [proxy] structural diagnostics -- no
         # credentials, prompts, or model output are ever emitted there.
-        & $python -m uvicorn proxy:app --host 127.0.0.1 --port $Port --log-level warning --no-access-log 2>&1 |
-            ForEach-Object { Write-Line ([string]$_) }
+        #
+        # The preference is relaxed around the call because `2>&1` wraps every
+        # stderr line of a native command in an ErrorRecord: under 'Stop' the
+        # first one -- a uvicorn warning about a malformed request, say -- is a
+        # terminating NativeCommandError that kills this supervisor with exit
+        # code 1 and takes its uvicorn child with it, leaving no explanation in
+        # the log because the failure never reaches Write-Line. stderr is meant
+        # to be logged here, not to be fatal.
+        $outerPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $python -m uvicorn proxy:app --host 127.0.0.1 --port $Port --log-level warning --no-access-log 2>&1 |
+                ForEach-Object { Write-Line ([string]$_) }
+        } finally {
+            $ErrorActionPreference = $outerPreference
+        }
         $code    = $LASTEXITCODE
         $ranFor  = ((Get-Date) - $startedAt).TotalSeconds
         Write-Warn "uvicorn exited with code $code after $([math]::Round($ranFor))s"
