@@ -868,6 +868,64 @@ def main():
         print(f"       invented flags         : none; helper never writes session files")
         passed += 1
 
+    # --- anything that is not an API path stays on the machine ---------------
+    # Pointing a browser at the proxy is enough to produce the first two: any tab
+    # asks for a favicon, and Chrome with its devtools open asks for
+    # /.well-known/appspecific/com.chrome.devtools.json. Forwarded, they came back
+    # as an HTML error page the JSON check could not parse, were retried three
+    # times, and were counted as a failure of the API traffic they have nothing to
+    # do with. The rest of this list is the point of the check: nobody enumerated
+    # them anywhere, and they must be refused all the same, because the rule is
+    # "only /v1 goes out" rather than "these particular probes stay in".
+    from proxy import is_api_path
+
+    probes = ["/favicon.ico", "/.well-known/appspecific/com.chrome.devtools.json",
+              "/robots.txt", "/apple-touch-icon-120x120.png", "/index.html",
+              "/socket.io/?EIO=4", "/some/deep/path/nobody/listed", "/ui",
+              "/v2/messages", "/api/v1/messages"]
+    mock_before = httpx.get(f"{MOCK}/_mock_stats", timeout=10).json()
+    stats_before = stats()
+    codes = {p: httpx.get(f"{PROXY}{p}", timeout=10).status_code for p in probes}
+    mock_after = httpx.get(f"{MOCK}/_mock_stats", timeout=10).json()
+    stats_after = stats()
+
+    errs = []
+    for probe, code in codes.items():
+        if code != 404:
+            errs.append(f"{probe} answered {code}, expected 404")
+    if sum(mock_after.values()) != sum(mock_before.values()):
+        errs.append(f"a probe reached the upstream: {mock_before} -> {mock_after}")
+    if stats_after.get("total_requests") != stats_before.get("total_requests"):
+        errs.append(f"probes counted as API traffic: total_requests "
+                    f"{stats_before.get('total_requests')} -> "
+                    f"{stats_after.get('total_requests')}")
+    counted = (stats_after.get("local_404_responses", 0)
+               - stats_before.get("local_404_responses", 0))
+    if counted != len(probes):
+        errs.append(f"local_404_responses moved by {counted}, expected {len(probes)}")
+    # The inverted test must not swallow a real API path -- a rule that is too
+    # narrow here breaks proxying instead of protecting it.
+    for api_path in ("v1/messages", "/v1/messages", "v1/messages/count_tokens",
+                     "v1/models", "v1/complete", "V1/Messages",
+                     "v1/organizations/usage_report/messages"):
+        if not is_api_path(api_path):
+            errs.append(f"an API path would be refused: {api_path}")
+
+    if errs:
+        print("[FAIL] only API paths are forwarded, everything else stays local")
+        for e in errs:
+            print(f"       - {e}")
+        failed += 1
+    else:
+        print("[PASS] only API paths are forwarded, everything else stays local")
+        print(f"       answered 404 locally   : {len(probes)} paths "
+              f"(favicon, .well-known, /index.html, /v2/..., unlisted paths)")
+        print(f"       upstream attempts      : unchanged "
+              f"({sum(mock_before.values())})")
+        print(f"       API counters           : untouched, counted as "
+              f"local_404_responses instead")
+        passed += 1
+
     print(f"\n{'=' * 64}\nscenario results: {passed} passed, {failed} failed")
     print("proxy counters:", json.dumps(
         {k: v for k, v in stats().items() if isinstance(v, int)}, indent=2))
