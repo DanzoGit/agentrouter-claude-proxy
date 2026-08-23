@@ -50,6 +50,7 @@ from collections import OrderedDict, deque
 from email.utils import parsedate_tz
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Optional
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 import httpx
 from fastapi import FastAPI, Request
@@ -230,6 +231,10 @@ STATS: dict[str, int] = {
     "dropped_sse_frames": 0,
     "post_commit_failures": 0,
     "client_disconnects": 0,
+    # Paths a browser asks for on its own, answered here instead of upstream.
+    # Deliberately outside total_requests: they are not API traffic, and folding
+    # them in would inflate the figure /_stats reports as "requests".
+    "local_404_responses": 0,
     "failed_requests": 0,
     # 4xx broken out by kind. upstream_4xx above stays the aggregate.
     "upstream_400": 0,
@@ -299,7 +304,15 @@ _EVENT_SEQ = 0
 _SECRET_MASKS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"tail=\.\.\.[^\s>]{1,8}"), "tail=...****"),
     (re.compile(r"sk-ant-[A-Za-z0-9_\-]{4,}"), "sk-ant-****"),
+    # Other gateways issue sk-... without the vendor segment. Placed after the
+    # pattern above so an Anthropic key still reads as one, and long enough that
+    # no ordinary word starting with "sk-" is caught.
+    (re.compile(r"(?<!\w)sk-[A-Za-z0-9_\-]{16,}"), "sk-****"),
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{4,}"), "Bearer ****"),
+    # Basic holds "user:password" in base64, so the scheme name is not the part
+    # worth keeping quiet -- what follows it is. Without this, the name=value net
+    # below stops at the space and leaves the credential itself in place.
+    (re.compile(r"(?i)\bbasic\s+[A-Za-z0-9+/=]{8,}"), "Basic ****"),
     # (?<!\w) keeps max_tokens=1024 and stream=True readable -- an underscore or
     # letter in front means this is a longer word, not one of these names -- while
     # still reaching the value in x-api-key=... and refresh-token=...
@@ -394,14 +407,42 @@ def is_sensitive_header(name: str) -> bool:
 
 
 def redact_headers(headers: dict[str, str]) -> dict[str, str]:
-    """Header names preserved, sensitive values replaced by a length hint."""
+    """
+    Header names preserved, sensitive values replaced by a length hint.
+
+    A name this does not recognize as a credential still gets its value run
+    through mask_secrets: location and referer carry a full URL, and a URL is
+    allowed to carry ?api_key=. Ordinary values -- content-type, a byte count, a
+    request id -- match none of those patterns and come back unchanged.
+    """
     out: dict[str, str] = {}
     for k, v in headers.items():
         if is_sensitive_header(k):
             out[k] = f"<redacted len={len(v)}>"
         else:
-            out[k] = v
+            out[k] = mask_secrets(v)
     return out
+
+
+# Parameters are separated by "&", and historically also by ";" -- a form
+# modern parsers no longer split on, but one an intermediary may still honour.
+# Splitting on both keeps a value from hiding behind the separator this code
+# happens not to recognize; the capturing group means the separators come back
+# in the output exactly as they arrived.
+_QUERY_SPLIT_RE = re.compile(r"([&;])")
+
+
+def query_key(name: str) -> str:
+    """
+    A parameter name reduced to the form SENSITIVE_QUERY_KEYS is written in.
+
+    The name on the wire may be percent-encoded, and the server decodes it before
+    it means anything: api%5Fkey, api+key and API-KEY all reach the upstream as
+    api_key. Classifying the raw spelling therefore lets an encoded name walk a
+    credential straight through, so the name is decoded first -- for the decision
+    only. What gets printed keeps the spelling the caller used.
+    """
+    return re.sub(r"[-\s]+", "_", unquote_plus(name).strip().lower())
 
 
 def redact_query(query: str) -> str:
@@ -420,14 +461,14 @@ def redact_query(query: str) -> str:
     """
     if not query:
         return query
-    parts: list[str] = []
-    for part in query.split("&"):
-        name, sep, value = part.partition("=")
-        if sep and value and name.strip().lower().replace("-", "_") in SENSITIVE_QUERY_KEYS:
-            parts.append(f"{name}=****")
-        else:
-            parts.append(part)
-    return "&".join(parts)
+    # Odd positions are the separators the regex captured; even ones are the
+    # parameters between them.
+    tokens = _QUERY_SPLIT_RE.split(query)
+    for i in range(0, len(tokens), 2):
+        name, sep, value = tokens[i].partition("=")
+        if sep and value and query_key(name) in SENSITIVE_QUERY_KEYS:
+            tokens[i] = f"{name}=****"
+    return "".join(tokens)
 
 
 def safe_upstream(url: str) -> str:
@@ -439,16 +480,28 @@ def safe_upstream(url: str) -> str:
     this string is printed at startup, on every request line, and served by
     /_health, /_stats and /. The address the requests actually go to is built
     from UPSTREAM itself; only what gets shown passes through here.
+
+    Splitting this by hand was wrong for a base URL with no path: everything
+    after the host, query included, landed in the authority and was printed
+    verbatim, so https://gw.example?api-key=... leaked. urlsplit knows where a
+    query starts whether or not a path precedes it.
     """
-    scheme, sep, rest = url.partition("://")
-    if not sep:
-        scheme, rest = "", url
-    authority, slash, tail = rest.partition("/")
-    if "@" in authority:  # user:password@host
-        authority = f"****@{authority.rsplit('@', 1)[1]}"
-    path, qmark, query = tail.partition("?")
-    shown = f"{scheme}{sep}{authority}{slash}{path}"
-    return f"{shown}?{redact_query(query)}" if qmark else shown
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        # An address urlsplit refuses (an unclosed IPv6 bracket, say) is one
+        # httpx will refuse too, so the proxy is not going anywhere either way.
+        # Printing the raw string to explain that would defeat the whole point
+        # of this function, so it stays unprinted and .env is where to look.
+        return "<unparsable upstream address>"
+
+    netloc = parts.netloc
+    if "@" in netloc:  # user:password@host
+        netloc = f"****@{netloc.rsplit('@', 1)[1]}"
+    # A fragment never reaches a server and has no business holding a secret,
+    # but it is printed, so it is treated like the query rather than trusted.
+    return urlunsplit((parts.scheme, netloc, parts.path,
+                       redact_query(parts.query), redact_query(parts.fragment)))
 
 
 # Computed once: every place that prints the upstream uses this, never UPSTREAM.
@@ -462,14 +515,15 @@ def key_fingerprint(key: str) -> str:
     return f"<len={len(key)} tail=...{key[-4:]}>"
 
 
-def preview(body: bytes, limit: int = 160) -> str:
+def preview(body: bytes) -> str:
     """
     Sanitized diagnostic for an unusable body: structural shape only.
 
-    Never returns prompt or completion text -- an unusable upstream body is
-    typically an error page or a gateway notice, but it could contain echoed
-    request content, so only a classification and the head of the payload with
-    whitespace collapsed is emitted.
+    Never returns prompt or completion text. An unusable upstream body is
+    typically an error page or a gateway notice, but it could carry echoed
+    request content or a partial completion, so nothing here quotes it: each
+    branch reports a classification and measurements, and the fallback for a
+    shape nobody anticipated does the same rather than printing the head.
     """
     if not body:
         return "<empty>"
@@ -508,8 +562,24 @@ def preview(body: bytes, limit: int = 160) -> str:
         ordered = ",".join(list(dict.fromkeys(n for n in names if n))[:8]) or "<unnamed>"
         return f"<sse {len(body)}B, frames={frames}, events={ordered}>"
 
-    collapsed = " ".join(stripped.split())
-    return f"<non-json {len(body)}B: {collapsed[:limit]!r}>"
+    # Anything else. This branch used to print the head of the payload with
+    # whitespace collapsed, which is precisely where an echoed prompt or a
+    # partial completion would appear -- the one shape that is unclassified is
+    # also the one nothing is known about, so quoting it was the weakest link in
+    # a function whose whole promise is that it never quotes. Measurements answer
+    # the diagnostic question -- how big, one line or many, text or binary, plain
+    # ASCII or not -- without reproducing a character of the body.
+    # U+FFFD is what errors="replace" left behind, one per byte sequence that is
+    # not valid UTF-8; a body mostly made of them is not text at all.
+    undecodable = stripped.count("\ufffd")
+    if undecodable * 10 > len(stripped):
+        return f"<binary {len(body)}B, {undecodable} undecodable sequences>"
+    lines = stripped.count("\n") + 1
+    words = len(stripped.split())
+    shape = "markup" if stripped.startswith("<") else "text"
+    charset = "ascii" if stripped.isascii() else "non-ascii"
+    return (f"<non-json {len(body)}B, {shape}, {charset}, "
+            f"lines={lines}, words={words}>")
 
 
 def body_parses_as_json(body: bytes) -> bool:
@@ -533,6 +603,23 @@ def client_will_json_parse(content_type: str) -> bool:
     """
     ct = (content_type or "").lower()
     return "application/json" in ct or "+json" in ct
+
+
+def json_body_expected(content_type: str) -> bool:
+    """
+    Whether a body under this content-type is still owed a JSON shape.
+
+    Genuine API replies arrive as application/json and, on some routes, as
+    text/plain -- AgentRouter has been observed serving a well-formed message
+    that way -- so both stay under the JSON contract, as does a reply that names
+    no type at all. A body that names some other type is not an API reply: the
+    upstream serves /favicon.ico as image/x-icon and a landing page as text/html.
+    Judging those as malformed JSON condemns a sound response.
+    """
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if not ct:
+        return True
+    return ct in ("application/json", "text/plain") or ct.endswith("+json")
 
 
 # ----------------------------------------------------------------------------
@@ -1039,13 +1126,23 @@ async def reliable_stream_body(response: httpx.Response, client: httpx.AsyncClie
 # ----------------------------------------------------------------------------
 
 
-def validate_json_response(status: int, body: bytes, is_messages: bool) -> tuple[bool, str]:
+def validate_json_response(status: int, body: bytes, is_messages: bool,
+                           content_type: str = "") -> tuple[bool, str]:
     """
     Validate a non-streaming upstream body. Only HTTP 200 is validated for
     shape; non-2xx bodies are real errors and are forwarded verbatim.
     """
     if status != 200:
         return True, "non_200_forwarded_verbatim"
+
+    # A path outside the JSON API may legitimately answer with something else,
+    # and the catch-all route forwards every path. Parsing /favicon.ico's
+    # image/x-icon as JSON marks a sound 200 invalid, spends all three attempts
+    # re-fetching the same bytes and answers 502 -- which a client reads as a
+    # dead endpoint, and it reads it precisely while probing whether the endpoint
+    # is alive. The API's own replies are still held to the contract below.
+    if not is_messages and not json_body_expected(content_type):
+        return True, "non_json_content_type_forwarded_verbatim"
 
     if not body or not body.strip():
         bump("empty_200_responses")
@@ -1216,7 +1313,7 @@ async def attempt_upstream(
     response_headers = dict(response.headers)
     await close_quietly(response, client)
 
-    valid, reason = validate_json_response(status, raw, is_messages)
+    valid, reason = validate_json_response(status, raw, is_messages, content_type)
     if not valid:
         log(f"invalid response: {reason}")
         # A genuine upstream error object is a real rejection, not a transport
@@ -2150,8 +2247,50 @@ async def ui() -> HTMLResponse:
     return HTMLResponse(_UI_CACHE["html"], headers={"cache-control": "no-store"})
 
 
+# Only the API surface this proxy exists for is relayed; everything else is
+# answered here and never leaves the machine.
+#
+# The catch-all below used to forward whatever path it was given, which turned a
+# browser's own curiosity into outbound traffic: pointing a tab at the proxy is
+# enough to make it ask for /favicon.ico, and Chrome with its devtools open also
+# asks for /.well-known/appspecific/com.chrome.devtools.json. The upstream answers
+# those with an HTML error page that validate_json_response cannot parse, so a
+# single probe became three attempts, a failed_requests and three
+# malformed_streams -- all attributed to API traffic that never happened.
+#
+# Listing the probes would have been the wrong shape for the fix: such a list only
+# ever covers the ones already seen, and the next browser, extension or link
+# checker arrives with a name that is not on it. So the test is inverted -- a path
+# is relayed only when it looks like the API being relayed. Anything else is a
+# local 404 regardless of what it is called, which is the only version of this
+# that cannot be outgrown. If a future API surface lives outside /v1, adding its
+# prefix here is what makes it reachable; until then a 404 in the log names the
+# exact path that was refused.
+_API_PREFIXES = ("v1/",)
+
+
+def is_api_path(path: str) -> bool:
+    """Whether this path belongs to the API surface this proxy relays."""
+    return path.strip("/").lower().startswith(_API_PREFIXES)
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def proxy(request: Request, path: str) -> Response:
+    # Answered before total_requests is touched, so a browser looking for a
+    # favicon leaves no mark on the API figures. One line in the log rather than
+    # a request block: enough to explain a 404 someone is looking at, not enough
+    # to bury the traffic it sits between.
+    if not is_api_path(path):
+        bump("local_404_responses")
+        log(f"local 404: /{path} (not an API path, not forwarded)")
+        return JSONResponse(
+            {"type": "error",
+             "error": {"type": "not_found_error",
+                       "message": f"/{path} is not an API path. This proxy relays "
+                                  f"/v1/... calls to the upstream; see / for what "
+                                  f"it serves."}},
+            status_code=404)
+
     bump("total_requests")
     started = time.monotonic()
 

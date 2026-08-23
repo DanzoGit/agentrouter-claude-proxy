@@ -337,6 +337,7 @@ Invoke-RestMethod http://127.0.0.1:8787/_stats
   "dropped_sse_frames": 12,
   "post_commit_failures": 0,
   "client_disconnects": 2,
+  "local_404_responses": 7,
   "failed_requests": 1,
   "uptime_seconds": 3600.5
 }
@@ -350,6 +351,7 @@ Invoke-RestMethod http://127.0.0.1:8787/_stats
 | `dropped_sse_frames` | Non-Anthropic junk frames removed from streams |
 | `post_commit_failures` | Streams that broke *after* forwarding began (not retryable) |
 | `client_disconnects` | Times Claude Code abandoned a stream |
+| `local_404_responses` | Non-API paths answered here, never forwarded |
 
 `retries_successful` is the number that tells you whether the proxy is earning
 its keep. `post_commit_failures` should be near zero.
@@ -401,10 +403,18 @@ buffer, so a key fingerprint stays in the terminal where it was printed. A
 credential that arrives as a query parameter is redacted where the request line
 is built: `?api_key=sk-…` is recorded as `?api_key=****`, keeping the parameter
 name — which is the diagnosable half — while the value reaches neither the feed
-nor `logs/proxy.log`. The upstream still receives the query byte-for-byte.
+nor `logs/proxy.log`. The name is decoded before that decision, so `api%5Fkey`,
+which the gateway reads as `api_key`, is caught as well. The upstream still
+receives the query byte-for-byte.
 `ui/panel.html` is read from disk per request when its timestamp changes, so
 editing the page and pressing F5 is enough; the proxy keeps running. If the file
 is missing the proxy is unaffected and `/_ui` says so.
+
+Opening the panel also makes the browser fetch things on its own — a favicon from
+any tab, `/.well-known/appspecific/com.chrome.devtools.json` from Chrome with its
+devtools open. None of that is relayed: only paths starting with `v1/` go out, so
+those requests are answered here with a 404 and counted as `local_404_responses`.
+See *HTTP 404 — "is not an API path"* under Troubleshooting.
 
 ---
 
@@ -536,6 +546,23 @@ kill a process it did not start. Use another port instead:
 
 and update `ANTHROPIC_BASE_URL` to match.
 
+### HTTP 404 — "is not an API path"
+
+The proxy answered that itself; nothing was sent upstream. Only paths starting
+with `v1/` are relayed, and everything else gets a local 404 counted as
+`local_404_responses` in `/_stats`. `logs\proxy.log` names the exact path that
+was refused.
+
+This exists because a browser pointed at the proxy fetches things on its own —
+`/favicon.ico` from any tab, `/.well-known/appspecific/com.chrome.devtools.json`
+from Chrome with its devtools open. Forwarded, those came back from the gateway
+as an HTML error page the JSON check could not parse, so one stray probe cost
+three outbound attempts and a `failed_requests` that had nothing to do with the
+API traffic it sat between. Listing the known probes would only ever cover the
+ones already seen, so the rule is inverted instead: whatever a browser, an
+extension or a link checker asks for, it stays on the machine. If an API surface
+outside `/v1` ever matters, its prefix goes in `_API_PREFIXES` in `proxy.py`.
+
 ### Claude Code cannot connect at all
 
 The proxy is not running. Check:
@@ -583,7 +610,8 @@ This matters more than the feature list, so it is spelled out plainly.
   be mentioned at all, only its length is printed. A credential that arrives in
   a query string, in a header, or in the configured upstream address is redacted
   before the line is built, and an unusable upstream body is described by shape —
-  event names, byte counts, JSON keys — never quoted.
+  event names, byte counts, JSON keys, or plain measurements when the shape is
+  one nothing here recognizes — never quoted.
 
 In short: this handles transport and stream-format compatibility, plus transient
 malformed responses. Everything else is passed through honestly.
@@ -601,6 +629,9 @@ malformed responses. Everything else is passed through honestly.
 - `~/.claude/settings.json` contains your token. It is gitignored here and
   should never be committed to any repository.
 - Logs are bounded and rotate. They contain no sensitive content.
+- Only paths starting with `v1/` are relayed. Everything else — `/favicon.ico`,
+  `/.well-known/…`, a mistyped URL, whatever an extension decides to fetch — is
+  answered with a local 404 and never leaves the machine.
 - The panel at `/_ui` requests nothing from the network and polls no host but
   this proxy. Log lines are masked on their way into memory, so nothing served
   over HTTP carries a credential: key fingerprints, `sk-ant-…` values, `Bearer`

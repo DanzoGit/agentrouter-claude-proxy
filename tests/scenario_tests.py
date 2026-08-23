@@ -874,14 +874,23 @@ def main():
     # /_events exists, over HTTP. Send every shape of that mistake at once, read
     # the whole feed back, and assert not one canary survives while the
     # parameter NAMES -- the diagnosable half -- do.
+    #
+    # Two of these shapes are not the obvious one. api%5Fkey is what a client
+    # sends when it percent-encodes the name: the upstream decodes it back to
+    # api_key, so a check that reads the raw spelling would let it straight
+    # through. The last one uses ";", the separator query strings historically
+    # allowed, which an intermediary may still honour even though the parser here
+    # is not obliged to.
     print()
     Q_SECRETS = ["QUERY_CANARY_APIKEY_1", "QUERY_CANARY_TOKEN_2",
-                 "QUERY_CANARY_SECRET_3", "QUERY_CANARY_SIG_4"]
+                 "QUERY_CANARY_SECRET_3", "QUERY_CANARY_SIG_4",
+                 "QUERY_CANARY_ENCODED_5", "QUERY_CANARY_SEMI_6"]
     leaky_query = ("api_key=QUERY_CANARY_APIKEY_1"
                    "&access-token=QUERY_CANARY_TOKEN_2"
                    "&client_secret=QUERY_CANARY_SECRET_3"
                    "&signature=QUERY_CANARY_SIG_4"
-                   "&beta=true")
+                   "&api%5Fkey=QUERY_CANARY_ENCODED_5"
+                   "&beta=true;token=QUERY_CANARY_SEMI_6")
     r = httpx.post(f"{PROXY}/v1/messages?{leaky_query}", headers=H,
                    json={"model": "scenario:echo_query", "max_tokens": 16,
                          "messages": [{"role": "user", "content": "hi"}]}, timeout=60)
@@ -914,7 +923,7 @@ def main():
     else:
         ev = req_events[-1]
         for name in ("api_key=****", "access-token=****", "client_secret=****",
-                     "signature=****"):
+                     "signature=****", "api%5Fkey=****", "token=****"):
             if name not in ev["text"]:
                 errs.append(f"parameter not redacted in place: {name} missing from "
                             f"{ev['text']}")
@@ -953,11 +962,28 @@ def main():
          redact_query("api_key=SECRET&beta=true") == "api_key=****&beta=true"),
         ("query: name matched case- and dash-insensitively",
          redact_query("API-KEY=SECRET") == "API-KEY=****"),
+        # The name on the wire is not always the name the upstream reads. Each of
+        # these decodes to api_key, and each was returned verbatim before the
+        # classification learned to decode first.
+        ("query: a percent-encoded name is still classified",
+         redact_query("api%5Fkey=QUERY_SECRET") == "api%5Fkey=****"),
+        ("query: percent-encoding is matched case-insensitively",
+         redact_query("api%5fkey=QUERY_SECRET") == "api%5fkey=****"),
+        ("query: an encoded first letter does not hide the name",
+         redact_query("%61pi_key=QUERY_SECRET") == "%61pi_key=****"),
+        ("query: a plus or an encoded space reads as a separator",
+         redact_query("api+key=QUERY_SECRET") == "api+key=****"
+         and redact_query("api%20key=QUERY_SECRET") == "api%20key=****"),
+        ("query: the historical ';' separator is honoured",
+         redact_query("beta=true;api_key=QUERY_SECRET")
+         == "beta=true;api_key=****"),
         ("query: routing parameters untouched",
          redact_query("model=claude-opus-5&beta=true")
          == "model=claude-opus-5&beta=true"),
         ("query: empty string survives",
          redact_query("") == ""),
+        ("query: a name with no value is left alone",
+         redact_query("api_key=") == "api_key=" and redact_query("api_key") == "api_key"),
         ("mask: max_tokens is not a credential",
          mask_secrets("request shape: msgs=3 max_tokens=1024 stream=True")
          == "request shape: msgs=3 max_tokens=1024 stream=True"),
@@ -966,8 +992,27 @@ def main():
         ("mask: a key fingerprint keeps its brackets",
          mask_secrets("credential 1: <len=108 tail=...9fA1>")
          == "credential 1: <len=108 tail=...****>"),
+        # Bearer was masked and Basic was not, so the base64 of "user:password"
+        # survived the name=value net, which stops at the first space.
+        ("mask: a Basic credential is caught like a Bearer one",
+         "dXNlcjpwYXNzd29yZA==" not in mask_secrets(
+             "authorization=Basic dXNlcjpwYXNzd29yZA==")
+         and "T0tFTl9WQUxVRQ" not in mask_secrets("Basic T0tFTl9WQUxVRQ==")),
+        ("mask: a gateway key without the vendor segment is caught",
+         "sk-1234567890abcdefghij" not in mask_secrets(
+             "fallback credential sk-1234567890abcdefghij in use")),
+        ("mask: an Anthropic key still reads as one",
+         mask_secrets("token sk-ant-api03-abcdef") == "token sk-ant-****"),
         ("header: value hidden, name kept",
          "hunter2" not in json.dumps(redact_headers({"x-vendor-secret": "hunter2"}))),
+        # location and referer are not credential names, so their values used to
+        # be printed whole -- and a URL is free to carry a key in its query.
+        ("header: a URL in an ordinary header is scrubbed too",
+         "HEADER_CANARY" not in json.dumps(redact_headers(
+             {"location": "https://gw.example/v1?api_key=HEADER_CANARY"}))),
+        ("header: an ordinary value is not mangled",
+         redact_headers({"content-type": "application/json; charset=utf-8"})
+         == {"content-type": "application/json; charset=utf-8"}),
         ("header: an unlisted credential name is recognized",
          is_sensitive_header("x-auth-token") and is_sensitive_header("X-API-Key")),
         ("header: an ordinary header is not",
@@ -978,11 +1023,40 @@ def main():
         ("upstream: a key in the base URL never printed",
          "UPSTREAM_CANARY" not in safe_upstream(
              "https://gw.example/v1?api-key=UPSTREAM_CANARY")),
+        # Splitting the string by hand put everything after the host into the
+        # authority when no path followed, so this exact form leaked.
+        ("upstream: a key in a base URL with no path never printed",
+         safe_upstream("https://gw.example?api-key=UPSTREAM_CANARY")
+         == "https://gw.example?api-key=****"),
+        ("upstream: a fragment is treated like a query",
+         "UPSTREAM_CANARY" not in safe_upstream(
+             "https://gw.example/v1#token=UPSTREAM_CANARY")),
+        ("upstream: an address urlsplit rejects does not crash the import",
+         safe_upstream("http://[::1") == "<unparsable upstream address>"),
         ("upstream: an ordinary address is printed as-is",
-         safe_upstream("https://agentrouter.org") == "https://agentrouter.org"),
+         safe_upstream("https://agentrouter.org") == "https://agentrouter.org"
+         and safe_upstream("https://gw.example:8443/v1")
+         == "https://gw.example:8443/v1"),
         ("preview: a truncated stream reports events, not text",
          "PREVIEW_CANARY_MODEL_TEXT" not in preview(sse_body)
          and "message_start" in preview(sse_body)),
+        # The fallback for a body of no recognized shape used to print its head
+        # with whitespace collapsed -- the one branch that knows nothing about
+        # what it holds was the one that quoted it.
+        ("preview: an unrecognized body is described, never quoted",
+         preview(b"COMPLETION_SECRET_TEXT")
+         == "<non-json 22B, text, ascii, lines=1, words=1>"),
+        ("preview: shape survives without the content",
+         preview(b"PREVIEW_CANARY line one\nline two\n")
+         == "<non-json 33B, text, ascii, lines=2, words=5>"),
+        ("preview: a markup fragment is named, not echoed",
+         "PREVIEW_CANARY" not in preview(b"<p>PREVIEW_CANARY</p>")
+         and "markup" in preview(b"<p>PREVIEW_CANARY</p>")),
+        ("preview: a binary body is reported as binary",
+         preview(b"\x00\x01\x02\xff\xfe\xff\xfe\xff").startswith("<binary 8B,")),
+        ("preview: a JSON error envelope still names its keys",
+         preview(b'{"error":{"message":"PREVIEW_CANARY"}}')
+         == "<json object, keys=['error']>"),
     ]
     errs = [name for name, ok in checks if not ok]
 
@@ -995,8 +1069,70 @@ def main():
         print("[PASS] masking helpers redact credentials and nothing else")
         print(f"       checks                 : {len(checks)} (query, headers, "
               f"upstream address, body preview)")
+        print(f"       encoded names caught   : api%5Fkey, api+key, %61pi_key, "
+              f"and the ';' separator")
+        print(f"       never quoted           : an unrecognized body, described "
+              f"by shape instead")
         print(f"       kept diagnosable       : max_tokens, model, beta, "
               f"event names, parameter names")
+        passed += 1
+
+    # --- anything that is not an API path stays on the machine ---------------
+    # Pointing a browser at the proxy is enough to produce the first two: any tab
+    # asks for a favicon, and Chrome with its devtools open asks for
+    # /.well-known/appspecific/com.chrome.devtools.json. Forwarded, they came back
+    # as an HTML error page the JSON check could not parse, were retried three
+    # times, and were counted as a failure of the API traffic they have nothing to
+    # do with. The rest of this list is the point of the check: nobody enumerated
+    # them anywhere, and they must be refused all the same, because the rule is
+    # "only /v1 goes out" rather than "these particular probes stay in".
+    from proxy import is_api_path
+
+    probes = ["/favicon.ico", "/.well-known/appspecific/com.chrome.devtools.json",
+              "/robots.txt", "/apple-touch-icon-120x120.png", "/index.html",
+              "/socket.io/?EIO=4", "/some/deep/path/nobody/listed", "/ui",
+              "/v2/messages", "/api/v1/messages"]
+    mock_before = httpx.get(f"{MOCK}/_mock_stats", timeout=10).json()
+    stats_before = stats()
+    codes = {p: httpx.get(f"{PROXY}{p}", timeout=10).status_code for p in probes}
+    mock_after = httpx.get(f"{MOCK}/_mock_stats", timeout=10).json()
+    stats_after = stats()
+
+    errs = []
+    for probe, code in codes.items():
+        if code != 404:
+            errs.append(f"{probe} answered {code}, expected 404")
+    if sum(mock_after.values()) != sum(mock_before.values()):
+        errs.append(f"a probe reached the upstream: {mock_before} -> {mock_after}")
+    if stats_after.get("total_requests") != stats_before.get("total_requests"):
+        errs.append(f"probes counted as API traffic: total_requests "
+                    f"{stats_before.get('total_requests')} -> "
+                    f"{stats_after.get('total_requests')}")
+    counted = (stats_after.get("local_404_responses", 0)
+               - stats_before.get("local_404_responses", 0))
+    if counted != len(probes):
+        errs.append(f"local_404_responses moved by {counted}, expected {len(probes)}")
+    # The inverted test must not swallow a real API path -- a rule that is too
+    # narrow here breaks proxying instead of protecting it.
+    for api_path in ("v1/messages", "/v1/messages", "v1/messages/count_tokens",
+                     "v1/models", "v1/complete", "V1/Messages",
+                     "v1/organizations/usage_report/messages"):
+        if not is_api_path(api_path):
+            errs.append(f"an API path would be refused: {api_path}")
+
+    if errs:
+        print("[FAIL] only API paths are forwarded, everything else stays local")
+        for e in errs:
+            print(f"       - {e}")
+        failed += 1
+    else:
+        print("[PASS] only API paths are forwarded, everything else stays local")
+        print(f"       answered 404 locally   : {len(probes)} paths "
+              f"(favicon, .well-known, /index.html, /v2/..., unlisted paths)")
+        print(f"       upstream attempts      : unchanged "
+              f"({sum(mock_before.values())})")
+        print(f"       API counters           : untouched, counted as "
+              f"local_404_responses instead")
         passed += 1
 
     print(f"\n{'=' * 64}\nscenario results: {passed} passed, {failed} failed")
