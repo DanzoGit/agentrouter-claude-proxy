@@ -290,6 +290,55 @@ if ($Service) { Write-Line "  log      : $($script:LogPath) (rotates at $MaxLogK
 else          { Write-Line '  stop     : Ctrl+C' 'DarkGray' }
 Write-Line ''
 
+# A listener left behind by a supervisor that is no longer watching it is worse
+# than no listener at all: /_health still answers, so every later start decides
+# the proxy is fine and exits, and the restart that was meant to pick up new code
+# silently does nothing. Only direct children of this process are stopped, so an
+# unrelated python on the machine is never touched.
+function Stop-OwnUvicorn {
+    $childName = Split-Path -Leaf $python
+    $kids = @()
+    try {
+        $kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $PID" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq $childName })
+    } catch { }
+    foreach ($kid in $kids) {
+        Write-Warn "stopping leftover uvicorn (PID $($kid.ProcessId))"
+        Stop-Process -Id $kid.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Merge uvicorn's stderr into the rotating log. Its output is startup banners and
+# the proxy's own [proxy] structural diagnostics -- no credentials, prompts, or
+# model output are ever emitted there.
+#
+# The preference is relaxed around the call because `2>&1` wraps every stderr line
+# of a native command in an ErrorRecord: under 'Stop' the first one -- a uvicorn
+# warning about a malformed request, say -- is a terminating NativeCommandError
+# that kills this supervisor with exit code 1 and takes its uvicorn child with it,
+# leaving no explanation in the log because the failure never reaches Write-Line.
+# stderr is meant to be logged here, not to be fatal. Whatever ends the run, the
+# python this function started is stopped before returning, so no orphan is left
+# holding the port.
+function Invoke-Uvicorn {
+    param([int]$OnPort)
+    $savedPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    # Reported through a script variable rather than a return value: a function
+    # whose try block returns and whose finally block still has work to do is one
+    # more thing to be wrong about, and the exit code is the one fact the loop
+    # below has to get right.
+    $script:LastUvicornExit = $null
+    try {
+        & $python -m uvicorn proxy:app --host 127.0.0.1 --port $OnPort --log-level warning --no-access-log 2>&1 |
+            ForEach-Object { Write-Line ([string]$_) }
+        $script:LastUvicornExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedPreference
+        Stop-OwnUvicorn
+    }
+}
+
 # --host 127.0.0.1 is what keeps this loopback-only. Never change it to 0.0.0.0:
 # the proxy forwards whatever credential the client presents, so a LAN-reachable
 # listener lets any host on the network spend your API quota.
@@ -305,26 +354,17 @@ if ($Service) {
     while ($true) {
         $startedAt = Get-Date
 
-        # Merge uvicorn's stderr into the rotating log. Its output is startup
-        # banners and the proxy's own [proxy] structural diagnostics -- no
-        # credentials, prompts, or model output are ever emitted there.
-        #
-        # The preference is relaxed around the call because `2>&1` wraps every
-        # stderr line of a native command in an ErrorRecord: under 'Stop' the
-        # first one -- a uvicorn warning about a malformed request, say -- is a
-        # terminating NativeCommandError that kills this supervisor with exit
-        # code 1 and takes its uvicorn child with it, leaving no explanation in
-        # the log because the failure never reaches Write-Line. stderr is meant
-        # to be logged here, not to be fatal.
-        $outerPreference = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
         try {
-            & $python -m uvicorn proxy:app --host 127.0.0.1 --port $Port --log-level warning --no-access-log 2>&1 |
-                ForEach-Object { Write-Line ([string]$_) }
-        } finally {
-            $ErrorActionPreference = $outerPreference
+            Invoke-Uvicorn -OnPort $Port
+        } catch {
+            # Downgrading stderr inside Invoke-Uvicorn removes the one error that
+            # used to reach here, but a supervisor that can die without saying why
+            # is exactly the failure this loop exists to prevent. Anything else
+            # gets logged and treated as a crashed run rather than ending the
+            # script.
+            Write-Err "supervisor caught: $($_.Exception.Message)"
         }
-        $code    = $LASTEXITCODE
+        $code    = if ($null -ne $script:LastUvicornExit) { $script:LastUvicornExit } else { 'unknown' }
         $ranFor  = ((Get-Date) - $startedAt).TotalSeconds
         Write-Warn "uvicorn exited with code $code after $([math]::Round($ranFor))s"
 
