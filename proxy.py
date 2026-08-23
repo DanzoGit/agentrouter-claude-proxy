@@ -212,6 +212,10 @@ STATS: dict[str, int] = {
     "dropped_sse_frames": 0,
     "post_commit_failures": 0,
     "client_disconnects": 0,
+    # Paths a browser asks for on its own, answered here instead of upstream.
+    # Deliberately outside total_requests: they are not API traffic, and folding
+    # them in would inflate the figure /_stats reports as "requests".
+    "local_404_responses": 0,
     "failed_requests": 0,
     # 4xx broken out by kind. upstream_4xx above stays the aggregate.
     "upstream_400": 0,
@@ -1932,8 +1936,50 @@ async def root() -> JSONResponse:
     )
 
 
+# Only the API surface this proxy exists for is relayed; everything else is
+# answered here and never leaves the machine.
+#
+# The catch-all below used to forward whatever path it was given, which turned a
+# browser's own curiosity into outbound traffic: pointing a tab at the proxy is
+# enough to make it ask for /favicon.ico, and Chrome with its devtools open also
+# asks for /.well-known/appspecific/com.chrome.devtools.json. The upstream answers
+# those with an HTML error page that validate_json_response cannot parse, so a
+# single probe became three attempts, a failed_requests and three
+# malformed_streams -- all attributed to API traffic that never happened.
+#
+# Listing the probes would have been the wrong shape for the fix: such a list only
+# ever covers the ones already seen, and the next browser, extension or link
+# checker arrives with a name that is not on it. So the test is inverted -- a path
+# is relayed only when it looks like the API being relayed. Anything else is a
+# local 404 regardless of what it is called, which is the only version of this
+# that cannot be outgrown. If a future API surface lives outside /v1, adding its
+# prefix here is what makes it reachable; until then a 404 in the log names the
+# exact path that was refused.
+_API_PREFIXES = ("v1/",)
+
+
+def is_api_path(path: str) -> bool:
+    """Whether this path belongs to the API surface this proxy relays."""
+    return path.strip("/").lower().startswith(_API_PREFIXES)
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def proxy(request: Request, path: str) -> Response:
+    # Answered before total_requests is touched, so a browser looking for a
+    # favicon leaves no mark on the API figures. One line in the log rather than
+    # a request block: enough to explain a 404 someone is looking at, not enough
+    # to bury the traffic it sits between.
+    if not is_api_path(path):
+        bump("local_404_responses")
+        log(f"local 404: /{path} (not an API path, not forwarded)")
+        return JSONResponse(
+            {"type": "error",
+             "error": {"type": "not_found_error",
+                       "message": f"/{path} is not an API path. This proxy relays "
+                                  f"/v1/... calls to the upstream; see / for what "
+                                  f"it serves."}},
+            status_code=404)
+
     bump("total_requests")
 
     raw_body = await request.body()

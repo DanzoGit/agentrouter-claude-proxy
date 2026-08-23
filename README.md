@@ -334,6 +334,7 @@ Invoke-RestMethod http://127.0.0.1:8787/_stats
   "dropped_sse_frames": 12,
   "post_commit_failures": 0,
   "client_disconnects": 2,
+  "local_404_responses": 7,
   "failed_requests": 1,
   "uptime_seconds": 3600.5
 }
@@ -347,6 +348,7 @@ Invoke-RestMethod http://127.0.0.1:8787/_stats
 | `dropped_sse_frames` | Non-Anthropic junk frames removed from streams |
 | `post_commit_failures` | Streams that broke *after* forwarding began (not retryable) |
 | `client_disconnects` | Times Claude Code abandoned a stream |
+| `local_404_responses` | Non-API paths answered here, never forwarded |
 
 `retries_successful` is the number that tells you whether the proxy is earning
 its keep. `post_commit_failures` should be near zero.
@@ -481,6 +483,23 @@ kill a process it did not start. Use another port instead:
 
 and update `ANTHROPIC_BASE_URL` to match.
 
+### HTTP 404 — "is not an API path"
+
+The proxy answered that itself; nothing was sent upstream. Only paths starting
+with `v1/` are relayed, and everything else gets a local 404 counted as
+`local_404_responses` in `/_stats`. `logs\proxy.log` names the exact path that
+was refused.
+
+This exists because a browser pointed at the proxy fetches things on its own —
+`/favicon.ico` from any tab, `/.well-known/appspecific/com.chrome.devtools.json`
+from Chrome with its devtools open. Forwarded, those came back from the gateway
+as an HTML error page the JSON check could not parse, so one stray probe cost
+three outbound attempts and a `failed_requests` that had nothing to do with the
+API traffic it sat between. Listing the known probes would only ever cover the
+ones already seen, so the rule is inverted instead: whatever a browser, an
+extension or a link checker asks for, it stays on the machine. If an API surface
+outside `/v1` ever matters, its prefix goes in `_API_PREFIXES` in `proxy.py`.
+
 ### Claude Code cannot connect at all
 
 The proxy is not running. Check:
@@ -543,6 +562,9 @@ malformed responses. Everything else is passed through honestly.
 - `~/.claude/settings.json` contains your token. It is gitignored here and
   should never be committed to any repository.
 - Logs are bounded and rotate. They contain no sensitive content.
+- Only paths starting with `v1/` are relayed. Everything else — `/favicon.ico`,
+  `/.well-known/…`, a mistyped URL, whatever an extension decides to fetch — is
+  answered with a local 404 and never leaves the machine.
 
 ---
 
