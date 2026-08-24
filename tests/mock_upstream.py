@@ -133,6 +133,17 @@ async def handler(request: Request, path: str):
             "usage": {"input_tokens": 1, "output_tokens": 1},
         })
 
+    # Reflects the query string back so a test can prove the upstream receives
+    # it verbatim -- the proxy redacts credentials in what it PRINTS, never in
+    # what it forwards.
+    if scenario == "echo_query":
+        return JSONResponse({
+            "id": MSG_ID, "type": "message", "role": "assistant",
+            "model": "mock", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": request.url.query}],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+
     if scenario == "nonstream_valid":
         return JSONResponse({
             "id": MSG_ID, "type": "message", "role": "assistant", "model": "mock",

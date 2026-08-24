@@ -868,6 +868,215 @@ def main():
         print(f"       invented flags         : none; helper never writes session files")
         passed += 1
 
+    # --- the event feed must never publish a credential ----------------------
+    # A client that puts its key in the query string used to have it printed in
+    # the request line -- to the terminal, to logs/proxy.log and, now that
+    # /_events exists, over HTTP. Send every shape of that mistake at once, read
+    # the whole feed back, and assert not one canary survives while the
+    # parameter NAMES -- the diagnosable half -- do.
+    #
+    # Two of these shapes are not the obvious one. api%5Fkey is what a client
+    # sends when it percent-encodes the name: the upstream decodes it back to
+    # api_key, so a check that reads the raw spelling would let it straight
+    # through. The last one uses ";", the separator query strings historically
+    # allowed, which an intermediary may still honour even though the parser here
+    # is not obliged to.
+    print()
+    Q_SECRETS = ["QUERY_CANARY_APIKEY_1", "QUERY_CANARY_TOKEN_2",
+                 "QUERY_CANARY_SECRET_3", "QUERY_CANARY_SIG_4",
+                 "QUERY_CANARY_ENCODED_5", "QUERY_CANARY_SEMI_6"]
+    leaky_query = ("api_key=QUERY_CANARY_APIKEY_1"
+                   "&access-token=QUERY_CANARY_TOKEN_2"
+                   "&client_secret=QUERY_CANARY_SECRET_3"
+                   "&signature=QUERY_CANARY_SIG_4"
+                   "&api%5Fkey=QUERY_CANARY_ENCODED_5"
+                   "&beta=true;token=QUERY_CANARY_SEMI_6")
+    r = httpx.post(f"{PROXY}/v1/messages?{leaky_query}", headers=H,
+                   json={"model": "scenario:echo_query", "max_tokens": 16,
+                         "messages": [{"role": "user", "content": "hi"}]}, timeout=60)
+    feed_raw = httpx.get(f"{PROXY}/_events?limit=600", timeout=10).text
+    feed = json.loads(feed_raw)
+    stats_raw = httpx.get(f"{PROXY}/_stats", timeout=10).text
+    health_raw = httpx.get(f"{PROXY}/_health", timeout=10).text
+    root_raw = httpx.get(f"{PROXY}/", timeout=10).text
+
+    errs = []
+    for blob, where in ((feed_raw, "/_events"), (stats_raw, "/_stats"),
+                        (health_raw, "/_health"), (root_raw, "/")):
+        leaked = [s for s in Q_SECRETS if s in blob]
+        if leaked:
+            errs.append(f"{where} leaked: {leaked}")
+    # The upstream must still receive the real value, or the redaction would
+    # have broken authentication rather than protected it.
+    echoed = ""
+    if r.status_code == 200:
+        echoed = "".join(b.get("text", "") for b in r.json().get("content", []))
+    if "QUERY_CANARY_APIKEY_1" not in echoed:
+        errs.append(f"upstream did not receive the query verbatim "
+                    f"(status {r.status_code}, echoed {echoed!r})")
+    # Still diagnosable: names kept, harmless parameters untouched, and the
+    # request line still parses back into a method and a path.
+    req_events = [e for e in feed["events"]
+                  if e.get("kind") == "request" and "api_key" in e.get("text", "")]
+    if not req_events:
+        errs.append("the redacted request line never reached the feed")
+    else:
+        ev = req_events[-1]
+        for name in ("api_key=****", "access-token=****", "client_secret=****",
+                     "signature=****", "api%5Fkey=****", "token=****"):
+            if name not in ev["text"]:
+                errs.append(f"parameter not redacted in place: {name} missing from "
+                            f"{ev['text']}")
+        if "beta=true" not in ev["text"]:
+            errs.append("a harmless parameter was redacted too")
+        if ev.get("method") != "POST" or "?api_key=****" not in (ev.get("path") or ""):
+            errs.append(f"request line no longer parses: method={ev.get('method')} "
+                        f"path={ev.get('path')}")
+
+    if errs:
+        print("[FAIL] the event feed never publishes a credential")
+        for e in errs:
+            print(f"       - {e}")
+        failed += 1
+    else:
+        print("[PASS] the event feed never publishes a credential")
+        print(f"       canaries leaked        : none of {len(Q_SECRETS)} "
+              f"(checked /_events, /_stats, /_health, /)")
+        print(f"       feed still shows       : {req_events[-1]['path']}")
+        print(f"       upstream received      : the query verbatim (echoed back)")
+        passed += 1
+
+    # --- masking helpers, unit level ----------------------------------------
+    # Redaction that eats diagnostics gets switched off by whoever needs the
+    # diagnostics, so what must NOT be touched is pinned as tightly as what must.
+    from proxy import (is_sensitive_header, mask_secrets, preview, redact_headers,
+                       redact_query, safe_upstream)
+
+    sse_body = (b"event: message_start\n"
+                b'data: {"type":"message_start","message":{"id":"msg_1"}}\n\n'
+                b"event: content_block_delta\n"
+                b'data: {"type":"content_block_delta",'
+                b'"delta":{"text":"PREVIEW_CANARY_MODEL_TEXT"}}\n\n')
+    checks = [
+        ("query: credential value replaced, name kept",
+         redact_query("api_key=SECRET&beta=true") == "api_key=****&beta=true"),
+        ("query: name matched case- and dash-insensitively",
+         redact_query("API-KEY=SECRET") == "API-KEY=****"),
+        # The name on the wire is not always the name the upstream reads. Each of
+        # these decodes to api_key, and each was returned verbatim before the
+        # classification learned to decode first.
+        ("query: a percent-encoded name is still classified",
+         redact_query("api%5Fkey=QUERY_SECRET") == "api%5Fkey=****"),
+        ("query: percent-encoding is matched case-insensitively",
+         redact_query("api%5fkey=QUERY_SECRET") == "api%5fkey=****"),
+        ("query: an encoded first letter does not hide the name",
+         redact_query("%61pi_key=QUERY_SECRET") == "%61pi_key=****"),
+        ("query: a plus or an encoded space reads as a separator",
+         redact_query("api+key=QUERY_SECRET") == "api+key=****"
+         and redact_query("api%20key=QUERY_SECRET") == "api%20key=****"),
+        ("query: the historical ';' separator is honoured",
+         redact_query("beta=true;api_key=QUERY_SECRET")
+         == "beta=true;api_key=****"),
+        ("query: routing parameters untouched",
+         redact_query("model=claude-opus-5&beta=true")
+         == "model=claude-opus-5&beta=true"),
+        ("query: empty string survives",
+         redact_query("") == ""),
+        ("query: a name with no value is left alone",
+         redact_query("api_key=") == "api_key=" and redact_query("api_key") == "api_key"),
+        ("mask: max_tokens is not a credential",
+         mask_secrets("request shape: msgs=3 max_tokens=1024 stream=True")
+         == "request shape: msgs=3 max_tokens=1024 stream=True"),
+        ("mask: a stray name=value pair is still caught",
+         "SECRET" not in mask_secrets("x-api-key=SECRET refresh-token=SECRET")),
+        ("mask: a key fingerprint keeps its brackets",
+         mask_secrets("credential 1: <len=108 tail=...9fA1>")
+         == "credential 1: <len=108 tail=...****>"),
+        # Bearer was masked and Basic was not, so the base64 of "user:password"
+        # survived the name=value net, which stops at the first space.
+        ("mask: a Basic credential is caught like a Bearer one",
+         "dXNlcjpwYXNzd29yZA==" not in mask_secrets(
+             "authorization=Basic dXNlcjpwYXNzd29yZA==")
+         and "T0tFTl9WQUxVRQ" not in mask_secrets("Basic T0tFTl9WQUxVRQ==")),
+        ("mask: a gateway key without the vendor segment is caught",
+         "sk-1234567890abcdefghij" not in mask_secrets(
+             "fallback credential sk-1234567890abcdefghij in use")),
+        ("mask: an Anthropic key still reads as one",
+         mask_secrets("token sk-ant-api03-abcdef") == "token sk-ant-****"),
+        ("header: value hidden, name kept",
+         "hunter2" not in json.dumps(redact_headers({"x-vendor-secret": "hunter2"}))),
+        # location and referer are not credential names, so their values used to
+        # be printed whole -- and a URL is free to carry a key in its query.
+        ("header: a URL in an ordinary header is scrubbed too",
+         "HEADER_CANARY" not in json.dumps(redact_headers(
+             {"location": "https://gw.example/v1?api_key=HEADER_CANARY"}))),
+        ("header: an ordinary value is not mangled",
+         redact_headers({"content-type": "application/json; charset=utf-8"})
+         == {"content-type": "application/json; charset=utf-8"}),
+        ("header: an unlisted credential name is recognized",
+         is_sensitive_header("x-auth-token") and is_sensitive_header("X-API-Key")),
+        ("header: an ordinary header is not",
+         not is_sensitive_header("idempotency-key")
+         and not is_sensitive_header("content-type")),
+        ("upstream: userinfo never printed",
+         "p4ss" not in safe_upstream("https://user:p4ss@gw.example/v1")),
+        ("upstream: a key in the base URL never printed",
+         "UPSTREAM_CANARY" not in safe_upstream(
+             "https://gw.example/v1?api-key=UPSTREAM_CANARY")),
+        # Splitting the string by hand put everything after the host into the
+        # authority when no path followed, so this exact form leaked.
+        ("upstream: a key in a base URL with no path never printed",
+         safe_upstream("https://gw.example?api-key=UPSTREAM_CANARY")
+         == "https://gw.example?api-key=****"),
+        ("upstream: a fragment is treated like a query",
+         "UPSTREAM_CANARY" not in safe_upstream(
+             "https://gw.example/v1#token=UPSTREAM_CANARY")),
+        ("upstream: an address urlsplit rejects does not crash the import",
+         safe_upstream("http://[::1") == "<unparsable upstream address>"),
+        ("upstream: an ordinary address is printed as-is",
+         safe_upstream("https://agentrouter.org") == "https://agentrouter.org"
+         and safe_upstream("https://gw.example:8443/v1")
+         == "https://gw.example:8443/v1"),
+        ("preview: a truncated stream reports events, not text",
+         "PREVIEW_CANARY_MODEL_TEXT" not in preview(sse_body)
+         and "message_start" in preview(sse_body)),
+        # The fallback for a body of no recognized shape used to print its head
+        # with whitespace collapsed -- the one branch that knows nothing about
+        # what it holds was the one that quoted it.
+        ("preview: an unrecognized body is described, never quoted",
+         preview(b"COMPLETION_SECRET_TEXT")
+         == "<non-json 22B, text, ascii, lines=1, words=1>"),
+        ("preview: shape survives without the content",
+         preview(b"PREVIEW_CANARY line one\nline two\n")
+         == "<non-json 33B, text, ascii, lines=2, words=5>"),
+        ("preview: a markup fragment is named, not echoed",
+         "PREVIEW_CANARY" not in preview(b"<p>PREVIEW_CANARY</p>")
+         and "markup" in preview(b"<p>PREVIEW_CANARY</p>")),
+        ("preview: a binary body is reported as binary",
+         preview(b"\x00\x01\x02\xff\xfe\xff\xfe\xff").startswith("<binary 8B,")),
+        ("preview: a JSON error envelope still names its keys",
+         preview(b'{"error":{"message":"PREVIEW_CANARY"}}')
+         == "<json object, keys=['error']>"),
+    ]
+    errs = [name for name, ok in checks if not ok]
+
+    if errs:
+        print("[FAIL] masking helpers redact credentials and nothing else")
+        for e in errs:
+            print(f"       - {e}")
+        failed += 1
+    else:
+        print("[PASS] masking helpers redact credentials and nothing else")
+        print(f"       checks                 : {len(checks)} (query, headers, "
+              f"upstream address, body preview)")
+        print(f"       encoded names caught   : api%5Fkey, api+key, %61pi_key, "
+              f"and the ';' separator")
+        print(f"       never quoted           : an unrecognized body, described "
+              f"by shape instead")
+        print(f"       kept diagnosable       : max_tokens, model, beta, "
+              f"event names, parameter names")
+        passed += 1
+
     # --- anything that is not an API path stays on the machine ---------------
     # Pointing a browser at the proxy is enough to produce the first two: any tab
     # asks for a favicon, and Chrome with its devtools open asks for

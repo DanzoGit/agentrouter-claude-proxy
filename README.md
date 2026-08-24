@@ -119,6 +119,9 @@ the internet.
 - **Clean client-disconnect handling** — when Claude Code goes away mid-stream
   the upstream connection is closed rather than leaked.
 - **`/_health` and `/_stats` endpoints** for liveness and counters.
+- **A monitoring panel at `/_ui`**, over a `/_events` feed of the proxy's own log
+  lines. It loads nothing from the network and polls no host but this proxy, and
+  every line is masked before it enters the feed.
 - **Single-instance protection** — starting it twice on the same port is a
   no-op, not a crash.
 - **Loopback-only** — binds `127.0.0.1` and nothing else.
@@ -355,7 +358,67 @@ its keep. `post_commit_failures` should be near zero.
 
 ---
 
-## 15. Start automatically at logon (Windows)
+## 15. Monitoring panel
+
+```
+http://127.0.0.1:8787/_ui
+```
+
+One page that answers "what is it doing right now": the counters above, how
+long recent turns took, and the proxy's own log lines as they arrive. It is
+built to be left open on a second screen while Claude Code works, so a stalled
+turn or a run of retries is visible without watching a console.
+
+It reads `/_events`, which serves the last 600 log lines from memory, oldest
+first:
+
+```powershell
+Invoke-RestMethod 'http://127.0.0.1:8787/_events?limit=2'
+```
+
+```json
+{
+  "origin": 1787356211.4,
+  "seq": 128,
+  "buffered": 128,
+  "capacity": 600,
+  "gap": false,
+  "events": [
+    { "seq": 127, "t": 1787356802.7, "kind": "request", "method": "POST",
+      "path": "/v1/messages", "text": "POST /v1/messages -> ... stream=True" },
+    { "seq": 128, "t": 1787356814.3, "kind": "ok", "frames": 96, "seconds": 11.6,
+      "text": "stream complete: 96 frames in 11.6s" }
+  ]
+}
+```
+
+Pass `after=<seq>` to fetch only what is new. `origin` changes when the proxy
+restarts, so a caller can tell its history belongs to a dead process; `gap` is
+true when the buffer discarded lines that caller never saw. Set
+`PROXY_EVENT_BUFFER` to keep more or fewer lines.
+
+The page loads nothing from the network — no fonts, no scripts, no icons — and
+talks to no host but this proxy. Credentials are masked before a line enters the
+buffer, so a key fingerprint stays in the terminal where it was printed. A
+credential that arrives as a query parameter is redacted where the request line
+is built: `?api_key=sk-…` is recorded as `?api_key=****`, keeping the parameter
+name — which is the diagnosable half — while the value reaches neither the feed
+nor `logs/proxy.log`. The name is decoded before that decision, so `api%5Fkey`,
+which the gateway reads as `api_key`, is caught as well. The upstream still
+receives the query byte-for-byte.
+`ui/panel.html` is read from disk per request when its timestamp changes, so
+editing the page and pressing F5 is enough; the proxy keeps running. If the file
+is missing the proxy is unaffected and `/_ui` says so.
+
+Opening the panel also makes the browser fetch things on its own — a favicon from
+any tab, `/.well-known/appspecific/com.chrome.devtools.json` from Chrome with its
+devtools open. None of that is relayed: only paths starting with `v1/` go out, so
+those requests are answered here with a 404 and counted as `local_404_responses`.
+See *HTTP 404 — "is not an API path"* under Troubleshooting.
+
+---
+
+## 16. Start automatically at logon (Windows)
 
 ```powershell
 .\install-autostart.ps1
@@ -395,7 +458,7 @@ Get-Content .\logs\proxy.log -Tail 40
 
 ---
 
-## 16. Stop it or remove the task
+## 17. Stop it or remove the task
 
 ```powershell
 # Stop the current run, keep the task registered
@@ -424,7 +487,7 @@ that is no longer there.
 
 ---
 
-## 17. Troubleshooting
+## 18. Troubleshooting
 
 ### `API returned an empty or malformed response (HTTP 200)` — still
 
@@ -544,7 +607,11 @@ This matters more than the feature list, so it is spelled out plainly.
   visible error is better than a silently duplicated tool call.
 - **It never logs credentials, prompts, or model output.** Logs contain event
   types, frame counts, drop reasons, and status codes. Where a credential must
-  be mentioned at all, only its length is printed.
+  be mentioned at all, only its length is printed. A credential that arrives in
+  a query string, in a header, or in the configured upstream address is redacted
+  before the line is built, and an unusable upstream body is described by shape —
+  event names, byte counts, JSON keys, or plain measurements when the shape is
+  one nothing here recognizes — never quoted.
 
 In short: this handles transport and stream-format compatibility, plus transient
 malformed responses. Everything else is passed through honestly.
@@ -565,6 +632,13 @@ malformed responses. Everything else is passed through honestly.
 - Only paths starting with `v1/` are relayed. Everything else — `/favicon.ico`,
   `/.well-known/…`, a mistyped URL, whatever an extension decides to fetch — is
   answered with a local 404 and never leaves the machine.
+- The panel at `/_ui` requests nothing from the network and polls no host but
+  this proxy. Log lines are masked on their way into memory, so nothing served
+  over HTTP carries a credential: key fingerprints, `sk-ant-…` values, `Bearer`
+  values, sensitive query parameters, and userinfo or a key in the configured
+  upstream address are all redacted. Parameter and header *names* are kept, so
+  the feed stays useful. `tests/run-tests.ps1` asserts this with canary values
+  it then looks for across `/_events`, `/_stats`, `/_health` and `/`.
 
 ---
 
@@ -583,6 +657,7 @@ local `.env`. Copy `.env.example` to `.env` to change any of them.
 | `PROXY_CONNECT_TIMEOUT_S` | `15` | Upstream connect timeout |
 | `PROXY_READ_TIMEOUT_S` | `600` | Upstream read timeout |
 | `PROXY_VERBOSE` | `0` | Extra structural diagnostics |
+| `PROXY_EVENT_BUFFER` | `600` | Log lines kept in memory for `/_events` and `/_ui` |
 | `AGENTROUTER_API_KEY` | *(unset)* | Fallback credential, only if the client sends none |
 
 ---
@@ -599,6 +674,19 @@ above. It never contacts AgentRouter and never uses a real credential.
 It starts a mock upstream on `127.0.0.1:8788` and a throwaway proxy on
 `127.0.0.1:8789`, so an already-running proxy on 8787 is left undisturbed. Both
 are stopped when the run ends. Use `-MockPort` / `-ProxyPort` if those are busy.
+
+The panel has its own check:
+
+```powershell
+.\tests\ui-check.ps1
+```
+
+It puts a spread of outcomes through a throwaway proxy on `127.0.0.1:8897` —
+clean streams of different lengths, a replayed one, a hard failure, a few
+upstream statuses — then screenshots `/_ui` at four widths with headless Chrome
+and leaves the images in `%TEMP%\proxy-ui-check`. Add `-KeepRunning` to leave the
+instance up and open the panel by hand. Like the suite above it never contacts
+AgentRouter and never uses a real credential.
 
 ---
 
